@@ -14,7 +14,7 @@ flowchart TD
       twd[TemporalWorkerDeployment 'foo']
       
       subgraph "Current/default version"
-        d5["Deployment foo-v5, Version{DeploymentName: foo/ns, BuildId: v5}"]
+        d5["Deployment foo-v5, Version{DeploymentName: ns/foo, BuildID: v5}"]
         rs5["ReplicaSet foo-v5"]
         p5a["Pod foo-v5-a"]
         p5b["Pod foo-v5-b"]
@@ -26,7 +26,7 @@ flowchart TD
       end
 
       subgraph "Deprecated versions"
-        d1["Deployment foo-v1 Version{DeploymentName: foo/ns, BuildId: v1}"]
+        d1["Deployment foo-v1 Version{DeploymentName: ns/foo, BuildID: v1}"]
         rs1["ReplicaSet foo-v1"]
         p1a["Pod foo-v1-a"]
         p1b["Pod foo-v1-b"]
@@ -42,12 +42,12 @@ flowchart TD
     twd --> dN
     twd --> d5
 
-    p1a -. "poll version {foo/ns, v1}" .-> server
-    p1b -. "poll version {foo/ns, v1}" .-> server
+    p1a -. "poll version {ns/foo, v1}" .-> server
+    p1b -. "poll version {ns/foo, v1}" .-> server
 
-    p5a -. "poll version {foo/ns, v5}" .-> server
-    p5b -. "poll version {foo/ns, v5}" .-> server
-    p5c -. "poll version {foo/ns, v5}" .-> server
+    p5a -. "poll version {ns/foo, v5}" .-> server
+    p5b -. "poll version {ns/foo, v5}" .-> server
+    p5c -. "poll version {ns/foo, v5}" .-> server
 
     server["Temporal Server"]
 ```
@@ -71,6 +71,28 @@ Here is an example of a progressive cut-over strategy gated on the success of th
       workflowType: "HelloWorld"
 ```
 
+### Gate Input Flow
+
+When `spec.rollout.gate` is configured, the controller starts one test workflow per task queue in the Target Version. If gate input is provided, it is passed as the first workflow argument:
+
+```yaml
+rollout:
+  gate:
+    workflowType: "RolloutGate"
+    # Inline JSON object
+    input:
+      thresholds:
+        errorRate: 0.01
+        p95LatencyMs: 250
+    # Or reference ConfigMap/Secret (JSON document)
+    # inputFrom:
+    #   configMapKeyRef:
+    #     name: my-gate-input
+    #     key: payload.json
+```
+
+Input resolution happens in the controller before invoking the workflow. The payload must be a JSON object and is not logged, except for size and a short preview for debugging.
+
 ## Deployment Flow Diagram
 
 ```mermaid
@@ -84,14 +106,14 @@ sequenceDiagram
     Dev->>K8s: Create TemporalWorkerDeployment "foo" (v1)
     K8s-->>Ctl: Notify TemporalWorkerDeployment "foo" created
     Ctl->>K8s: Create Deployment "foo-v1"
-    Ctl->>T: Register build "v1" as new current version of "foo/ns"
+    Ctl->>T: Register build "v1" as new current version of "ns/foo"
     Dev->>K8s: Update TemporalWorker "foo" (v2)
     K8s-->>Ctl: Notify TemporalWorker "foo" updated
     Ctl->>K8s: Create Deployment "foo-v2"
-    Ctl->>T: Register build "v2" as new current version of "foo/ns"
+    Ctl->>T: Register build "v2" as new current version of "ns/foo"
     
     loop Poll Temporal API
-        Ctl-->>T: Wait for version {foo/ns, v1} to be drained (no open pinned wfs)
+        Ctl-->>T: Wait for version {ns/foo, v1} to be drained (no open pinned wfs)
     end
     
     Ctl->>K8s: Delete Deployment "foo-v1"

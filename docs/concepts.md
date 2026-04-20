@@ -8,7 +8,7 @@ This document defines key concepts and terminology used throughout the Temporal 
 A logical grouping in Temporal that represents a collection of workers that are deployed together and should be versioned together. Examples include "payment-processor", "notification-sender", or "data-pipeline-worker". This is a concept within Temporal itself, not specific to Kubernetes. See https://docs.temporal.io/production-deployment/worker-deployments/worker-versioning for more details.
 
 **Key characteristics:**
-- Identified by a unique worker deployment name (e.g., "payment-processor/staging")
+- Identified by a unique worker deployment name (e.g., "staging/payment-processor")
 - Can have multiple concurrent worker versions running simultaneously
 - Versions of a Worker Deployment are identified by Build IDs (e.g., "v1.5.1", "v1.5.2")
 - Temporal routes workflow executions to appropriate worker versions based on the `RoutingConfig` of the Worker Deployment that the versions are in.
@@ -87,7 +87,7 @@ Gradually increases the percentage of new workflow executions routed to the new 
 
 ### Worker Options
 Configuration that tells the controller how to connect to the same Temporal cluster and namespace that the worker is connected to:
-- **connection**: Reference to a `TemporalConnection` custom resource
+- **connectionRef**: A reference to a `TemporalConnection` custom resource. This object contains a `name` field to specify the `TemporalConnection` resource.
 - **temporalNamespace**: The Temporal namespace to connect to
 - **deploymentName**: The logical deployment name in Temporal (auto-generated if not specified)
 
@@ -95,7 +95,15 @@ Configuration that tells the controller how to connect to the same Temporal clus
 Defines how new versions are promoted:
 - **strategy**: Manual, AllAtOnce, or Progressive
 - **steps**: For Progressive strategy, defines ramp percentages and pause durations
-- **gate**: Optional workflow that must succeed on all task queues in the target Worker Deployment Version before promotion continues
+- **gate**: Optional workflow that must succeed on all task queues in the target Worker Deployment Version before promotion continues. Gate can receive an input payload:
+  - `workflowType`: The workflow name/type to execute for validation
+  - `input`: Inline JSON object passed as the first workflow argument
+  - `inputFrom`: Reference to a `ConfigMap` or `Secret` key whose contents are JSON; passed as the first workflow argument
+
+Notes on gate inputs:
+- Exactly one of `input` or `inputFrom` may be set.
+- The value must be a JSON object (not a string containing JSON).
+- Large/sensitive payloads should use `inputFrom.secretKeyRef` or split into smaller documents.
 
 ### Sunset Configuration
 Defines how Drained versions are cleaned up:

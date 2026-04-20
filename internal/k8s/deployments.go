@@ -11,7 +11,9 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strings"
 
+	"github.com/davecgh/go-spew/spew"
 	"github.com/distribution/reference"
 	temporaliov1alpha1 "github.com/temporalio/temporal-worker-controller/api/v1alpha1"
 	"github.com/temporalio/temporal-worker-controller/internal/controller/k8s.io/utils"
@@ -30,8 +32,10 @@ const (
 	twdNameLabel                  = "temporal.io/deployment-name"
 	WorkerDeploymentNameSeparator = "/"
 	ResourceNameSeparator         = "-"
-	MaxBuildIdLen                 = 63
+	MaxBuildIDLen                 = 63
+	MaxDeploymentNameLen          = 47
 	ConnectionSpecHashAnnotation  = "temporal.io/connection-spec-hash"
+	PodTemplateSpecHashAnnotation = "temporal.io/pod-template-spec-hash"
 )
 
 // DeploymentState represents the Kubernetes state of all deployments for a temporal worker deployment
@@ -112,10 +116,19 @@ func NewObjectRef(obj client.Object) *corev1.ObjectReference {
 }
 
 func ComputeBuildID(w *temporaliov1alpha1.TemporalWorkerDeployment) string {
+	// Check for user-provided build ID in spec.workerOptions.unsafeCustomBuildID
+	if override := w.Spec.WorkerOptions.UnsafeCustomBuildID; override != "" {
+		cleaned := cleanBuildID(override)
+		if cleaned != "" {
+			return TruncateString(cleaned, MaxBuildIDLen)
+		}
+		// Fall through to default hash-based generation if buildID is invalid after cleaning
+	}
+
 	if containers := w.Spec.Template.Spec.Containers; len(containers) > 0 {
 		if img := containers[0].Image; img != "" {
 			shortHashSuffix := ResourceNameSeparator + utils.ComputeHash(&w.Spec.Template, nil, true)
-			maxImgLen := MaxBuildIdLen - len(shortHashSuffix)
+			maxImgLen := MaxBuildIDLen - len(shortHashSuffix)
 			imagePrefix := computeImagePrefix(img, maxImgLen)
 			return cleanBuildID(imagePrefix + shortHashSuffix)
 		}
@@ -130,8 +143,20 @@ func ComputeWorkerDeploymentName(w *temporaliov1alpha1.TemporalWorkerDeployment)
 }
 
 // ComputeVersionedDeploymentName generates a name for a versioned deployment
+// Name will be <=47 characters and unique for that Worker Deployment Version within the namespace.
 func ComputeVersionedDeploymentName(baseName, buildID string) string {
-	return CleanStringForDNS(baseName + ResourceNameSeparator + buildID)
+	fullName := baseName + ResourceNameSeparator + buildID
+	if len(fullName) > MaxDeploymentNameLen {
+		hashName := HashString(fullName)[:10]
+		fullName = TruncateString(baseName, 10) + ResourceNameSeparator + TruncateString(buildID, 10) + ResourceNameSeparator + hashName
+	}
+	return CleanStringForDNS(fullName)
+}
+
+func HashString(s string) string {
+	h := sha256.New()
+	_, _ = h.Write([]byte(s))
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 func computeImagePrefix(s string, maxLen int) string {
@@ -162,7 +187,8 @@ func TruncateString(s string, n int) string {
 func CleanStringForDNS(s string) string {
 	// Keep only letters, numbers, and dashes.
 	re := regexp.MustCompile(`[^a-zA-Z0-9-]+`)
-	return re.ReplaceAllString(s, ResourceNameSeparator)
+	// Lowercase to ensure RFC 1123 DNS label compliance for Kubernetes resource names.
+	return strings.ToLower(re.ReplaceAllString(s, ResourceNameSeparator))
 }
 
 // Build ID is used as a label in k8s, and as the build ID for
@@ -177,9 +203,21 @@ func CleanStringForDNS(s string) string {
 //
 // Temporal build IDs only need to be ASCII.
 func cleanBuildID(s string) string {
-	// Keep only letters, numbers, dashes, and dots.
+	// Keep only letters, numbers, dashes, underscores, and dots.
 	re := regexp.MustCompile(`[^a-zA-Z0-9-._]+`)
-	return re.ReplaceAllString(s, ResourceNameSeparator)
+	s = re.ReplaceAllString(s, ResourceNameSeparator)
+	// Trim leading/trailing separators to comply with K8s label requirements
+	// (must begin and end with alphanumeric character)
+	return strings.Trim(s, "-._")
+}
+
+// ComputeSelectorLabels returns the selector labels used by a versioned Deployment.
+// These are the same labels set on the Deployment.Spec.Selector.MatchLabels.
+func ComputeSelectorLabels(twdName, buildID string) map[string]string {
+	return map[string]string{
+		twdNameLabel: TruncateString(CleanStringForDNS(twdName), 63),
+		BuildIDLabel: TruncateString(buildID, 63),
+	}
 }
 
 // NewDeploymentWithOwnerRef creates a new deployment resource, including owner references
@@ -191,10 +229,7 @@ func NewDeploymentWithOwnerRef(
 	buildID string,
 	connection temporaliov1alpha1.TemporalConnectionSpec,
 ) *appsv1.Deployment {
-	selectorLabels := map[string]string{
-		twdNameLabel: TruncateString(CleanStringForDNS(objectMeta.GetName()), 63),
-		BuildIDLabel: TruncateString(buildID, 63),
-	}
+	selectorLabels := ComputeSelectorLabels(objectMeta.GetName(), buildID)
 
 	// Set pod labels
 	podLabels := make(map[string]string)
@@ -207,6 +242,108 @@ func NewDeploymentWithOwnerRef(
 
 	podSpec := spec.Template.Spec.DeepCopy()
 
+	// Apply controller-managed environment variables and volume mounts
+	ApplyControllerPodSpecModifications(podSpec, connection, spec.WorkerOptions.TemporalNamespace, workerDeploymentName, buildID)
+
+	// Build pod annotations
+	podAnnotations := make(map[string]string)
+	for k, v := range spec.Template.Annotations {
+		podAnnotations[k] = v
+	}
+	podAnnotations[ConnectionSpecHashAnnotation] = ComputeConnectionSpecHash(connection)
+	// Store hash of user-provided pod template spec BEFORE controller modifications
+	// This enables drift detection when build ID is stable
+	podAnnotations[PodTemplateSpecHashAnnotation] = ComputePodTemplateSpecHash(spec.Template)
+	blockOwnerDeletion := true
+
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:                       ComputeVersionedDeploymentName(objectMeta.Name, buildID),
+			Namespace:                  objectMeta.Namespace,
+			DeletionGracePeriodSeconds: nil,
+			Labels:                     selectorLabels,
+			Annotations:                spec.Template.Annotations,
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion:         typeMeta.APIVersion,
+				Kind:               typeMeta.Kind,
+				Name:               objectMeta.Name,
+				UID:                objectMeta.UID,
+				BlockOwnerDeletion: &blockOwnerDeletion,
+				Controller:         nil,
+			}},
+			// TODO(jlegrone): Add finalizer managed by the controller in order to prevent
+			//                 deleting deployments that are still reachable.
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: spec.Replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: selectorLabels,
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels:      podLabels,
+					Annotations: podAnnotations,
+				},
+				Spec: *podSpec,
+			},
+			MinReadySeconds: spec.MinReadySeconds,
+		},
+	}
+}
+
+// TODO (Shivam): Change hash when secret name is updated as well.
+func ComputeConnectionSpecHash(connection temporaliov1alpha1.TemporalConnectionSpec) string {
+	// HostPort is required, but MutualTLSSecret can be empty for non-mTLS connections
+	if connection.HostPort == "" {
+		return ""
+	}
+
+	hasher := sha256.New()
+
+	// Hash connection spec fields in deterministic order
+	_, _ = hasher.Write([]byte(connection.HostPort))
+	if connection.MutualTLSSecretRef != nil {
+		_, _ = hasher.Write([]byte(connection.MutualTLSSecretRef.Name))
+	} else if connection.APIKeySecretRef != nil {
+		_, _ = hasher.Write([]byte(connection.APIKeySecretRef.Name))
+	}
+
+	return hex.EncodeToString(hasher.Sum(nil))
+}
+
+// ComputePodTemplateSpecHash computes a SHA256 hash of the user-provided pod template spec.
+// This hash is used to detect drift when the build ID is stable but the pod spec has changed.
+// The hash captures ALL user-controllable fields in the pod template spec.
+func ComputePodTemplateSpecHash(template corev1.PodTemplateSpec) string {
+	hasher := sha256.New()
+
+	// Use spew to get a deterministic string representation of the entire struct.
+	// This captures ALL fields including env vars, commands, volumes, etc.
+	// The config MUST NOT be changed because that could change the result of a hash operation.
+	printer := &spew.ConfigState{
+		Indent:                  " ",
+		SortKeys:                true,
+		DisableMethods:          true,
+		SpewKeys:                true,
+		DisablePointerAddresses: true,
+		DisableCapacities:       true,
+	}
+
+	_, _ = hasher.Write([]byte(printer.Sprintf("%#v", template)))
+
+	return hex.EncodeToString(hasher.Sum(nil))
+}
+
+// ApplyControllerPodSpecModifications applies controller-managed environment variables and
+// volume mounts to a pod spec. This is used both when creating new deployments and when
+// updating existing deployments for drift detection.
+func ApplyControllerPodSpecModifications(
+	podSpec *corev1.PodSpec,
+	connection temporaliov1alpha1.TemporalConnectionSpec,
+	temporalNamespace string,
+	workerDeploymentName string,
+	buildID string,
+) {
 	// Add environment variables to containers
 	for i, container := range podSpec.Containers {
 		container.Env = append(container.Env,
@@ -216,7 +353,7 @@ func NewDeploymentWithOwnerRef(
 			},
 			corev1.EnvVar{
 				Name:  "TEMPORAL_NAMESPACE",
-				Value: spec.WorkerOptions.TemporalNamespace,
+				Value: temporalNamespace,
 			},
 			corev1.EnvVar{
 				Name:  "TEMPORAL_DEPLOYMENT_NAME",
@@ -261,66 +398,19 @@ func NewDeploymentWithOwnerRef(
 				},
 			},
 		})
-	}
-
-	// Build pod annotations
-	podAnnotations := make(map[string]string)
-	for k, v := range spec.Template.Annotations {
-		podAnnotations[k] = v
-	}
-	podAnnotations[ConnectionSpecHashAnnotation] = ComputeConnectionSpecHash(connection)
-	blockOwnerDeletion := true
-
-	return &appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:                       ComputeVersionedDeploymentName(objectMeta.Name, buildID),
-			Namespace:                  objectMeta.Namespace,
-			DeletionGracePeriodSeconds: nil,
-			Labels:                     selectorLabels,
-			Annotations:                spec.Template.Annotations,
-			OwnerReferences: []metav1.OwnerReference{{
-				APIVersion:         typeMeta.APIVersion,
-				Kind:               typeMeta.Kind,
-				Name:               objectMeta.Name,
-				UID:                objectMeta.UID,
-				BlockOwnerDeletion: &blockOwnerDeletion,
-				Controller:         nil,
-			}},
-			// TODO(jlegrone): Add finalizer managed by the controller in order to prevent
-			//                 deleting deployments that are still reachable.
-		},
-		Spec: appsv1.DeploymentSpec{
-			Replicas: spec.Replicas,
-			Selector: &metav1.LabelSelector{
-				MatchLabels: selectorLabels,
-			},
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels:      podLabels,
-					Annotations: podAnnotations,
+	} else if connection.APIKeySecretRef != nil {
+		for i, container := range podSpec.Containers {
+			container.Env = append(container.Env,
+				corev1.EnvVar{
+					Name: "TEMPORAL_API_KEY",
+					ValueFrom: &corev1.EnvVarSource{
+						SecretKeyRef: connection.APIKeySecretRef,
+					},
 				},
-				Spec: *podSpec,
-			},
-			MinReadySeconds: spec.MinReadySeconds,
-		},
+			)
+			podSpec.Containers[i] = container
+		}
 	}
-}
-
-func ComputeConnectionSpecHash(connection temporaliov1alpha1.TemporalConnectionSpec) string {
-	// HostPort is required, but MutualTLSSecret can be empty for non-mTLS connections
-	if connection.HostPort == "" {
-		return ""
-	}
-
-	hasher := sha256.New()
-
-	// Hash connection spec fields in deterministic order
-	_, _ = hasher.Write([]byte(connection.HostPort))
-	if connection.MutualTLSSecretRef != nil {
-		_, _ = hasher.Write([]byte(connection.MutualTLSSecretRef.Name))
-	}
-
-	return hex.EncodeToString(hasher.Sum(nil))
 }
 
 func NewDeploymentWithControllerRef(

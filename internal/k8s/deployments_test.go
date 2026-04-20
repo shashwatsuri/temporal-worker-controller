@@ -8,9 +8,11 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -301,7 +303,7 @@ func TestGenerateBuildID(t *testing.T) {
 				twd := testhelpers.MakeTWDWithImage("", "", digestedImg)
 				return twd, nil // only check 1 result, no need to compare
 			},
-			expectedPrefix:  digest[:k8s.MaxBuildIdLen-5],
+			expectedPrefix:  digest[:k8s.MaxBuildIDLen-5],
 			expectedHashLen: 4,
 			expectEquality:  false,
 		},
@@ -312,7 +314,7 @@ func TestGenerateBuildID(t *testing.T) {
 				twd := testhelpers.MakeTWDWithImage("", "", digestedNamedImg)
 				return twd, nil // only check 1 result, no need to compare
 			},
-			expectedPrefix:  digest[:k8s.MaxBuildIdLen-5],
+			expectedPrefix:  digest[:k8s.MaxBuildIDLen-5],
 			expectedHashLen: 4,
 			expectEquality:  false,
 		},
@@ -345,8 +347,83 @@ func TestGenerateBuildID(t *testing.T) {
 				twd := testhelpers.MakeTWDWithImage("", "", longImg)
 				return twd, nil // only check 1 result, no need to compare
 			},
-			expectedPrefix:  k8s.TruncateString("ThisIsAVeryLongHumanReadableImage_ThisIsAVeryLongHumanReadableImage_ThisIsAVeryLongHumanReadableImage"[:k8s.MaxBuildIdLen-5], -1),
+			expectedPrefix:  k8s.TruncateString("ThisIsAVeryLongHumanReadableImage_ThisIsAVeryLongHumanReadableImage_ThisIsAVeryLongHumanReadableImage"[:k8s.MaxBuildIDLen-5], -1),
 			expectedHashLen: 4,
+			expectEquality:  false,
+		},
+		{
+			name: "spec buildID override",
+			generateInputs: func() (*temporaliov1alpha1.TemporalWorkerDeployment, *temporaliov1alpha1.TemporalWorkerDeployment) {
+				twd := testhelpers.MakeTWDWithImage("", "", "some-image")
+				twd.Spec.WorkerOptions.UnsafeCustomBuildID = "manual-override-v1"
+				return twd, nil
+			},
+			expectedPrefix:  "manual-override-v1",
+			expectedHashLen: 2, // "v1" is length 2.
+			// The override returns cleanBuildID(buildIDValue).
+			// If buildID is "manual-override-v1", cleanBuildID returns "manual-override-v1".
+			// split by "-" gives ["manual", "override", "v1"]. last element is "v1", len is 2.
+			expectEquality: false,
+		},
+		{
+			name: "spec buildID override stability",
+			generateInputs: func() (*temporaliov1alpha1.TemporalWorkerDeployment, *temporaliov1alpha1.TemporalWorkerDeployment) {
+				// Two TWDs with DIFFERENT images but SAME buildID
+				twd1 := testhelpers.MakeTWDWithImage("", "", "image-v1")
+				twd1.Spec.WorkerOptions.UnsafeCustomBuildID = "stable-id"
+
+				twd2 := testhelpers.MakeTWDWithImage("", "", "image-v2")
+				twd2.Spec.WorkerOptions.UnsafeCustomBuildID = "stable-id"
+				return twd1, twd2
+			},
+			expectedPrefix:  "stable-id",
+			expectedHashLen: 2, // "id" has len 2
+			expectEquality:  true,
+		},
+		{
+			name: "spec buildID override with long value is truncated",
+			generateInputs: func() (*temporaliov1alpha1.TemporalWorkerDeployment, *temporaliov1alpha1.TemporalWorkerDeployment) {
+				// 72 char buildID - should be truncated to 63
+				longBuildID := "this-is-a-very-long-build-id-value-that-exceeds-63-characters-limit"
+				twd := testhelpers.MakeTWDWithImage("", "", "some-image")
+				twd.Spec.WorkerOptions.UnsafeCustomBuildID = longBuildID
+				return twd, nil
+			},
+			expectedPrefix:  "this-is-a-very-long-build-id-value-that-exceeds-63-characters-l",
+			expectedHashLen: 1, // "l" has len 1
+			expectEquality:  false,
+		},
+		{
+			name: "spec buildID override with empty value falls back to hash",
+			generateInputs: func() (*temporaliov1alpha1.TemporalWorkerDeployment, *temporaliov1alpha1.TemporalWorkerDeployment) {
+				twd := testhelpers.MakeTWDWithImage("", "", "fallback-image")
+				twd.Spec.WorkerOptions.UnsafeCustomBuildID = "" // empty UnsafeCustomBuildID
+				return twd, nil
+			},
+			expectedPrefix:  "fallback-image", // Falls back to image-based build ID
+			expectedHashLen: 4,
+			expectEquality:  false,
+		},
+		{
+			name: "spec buildID override with only invalid chars falls back to hash",
+			generateInputs: func() (*temporaliov1alpha1.TemporalWorkerDeployment, *temporaliov1alpha1.TemporalWorkerDeployment) {
+				twd := testhelpers.MakeTWDWithImage("", "", "fallback-image2")
+				twd.Spec.WorkerOptions.UnsafeCustomBuildID = "###$$$%%%" // all invalid chars
+				return twd, nil
+			},
+			expectedPrefix:  "fallback-image2", // Falls back to image-based build ID
+			expectedHashLen: 4,
+			expectEquality:  false,
+		},
+		{
+			name: "spec buildID override trims leading and trailing separators",
+			generateInputs: func() (*temporaliov1alpha1.TemporalWorkerDeployment, *temporaliov1alpha1.TemporalWorkerDeployment) {
+				twd := testhelpers.MakeTWDWithImage("", "", "some-image")
+				twd.Spec.WorkerOptions.UnsafeCustomBuildID = "---my-build-id---" // leading/trailing dashes
+				return twd, nil
+			},
+			expectedPrefix:  "my-build-id", // dashes trimmed
+			expectedHashLen: 2,             // "id" has len 2
 			expectEquality:  false,
 		},
 	}
@@ -358,11 +435,11 @@ func TestGenerateBuildID(t *testing.T) {
 			var build1, build2 string
 			if twd1 != nil {
 				build1 = k8s.ComputeBuildID(twd1)
-				verifyBuildId(t, build1, tt.expectedPrefix, tt.expectedHashLen)
+				verifyBuildID(t, build1, tt.expectedPrefix, tt.expectedHashLen)
 			}
 			if twd2 != nil {
 				build2 = k8s.ComputeBuildID(twd2)
-				verifyBuildId(t, build2, tt.expectedPrefix, tt.expectedHashLen)
+				verifyBuildID(t, build2, tt.expectedPrefix, tt.expectedHashLen)
 			}
 
 			// Check equality based on test case
@@ -375,9 +452,9 @@ func TestGenerateBuildID(t *testing.T) {
 	}
 }
 
-func verifyBuildId(t *testing.T, build, expectedPrefix string, expectedHashLen int) {
+func verifyBuildID(t *testing.T, build, expectedPrefix string, expectedHashLen int) {
 	assert.Truef(t, strings.HasPrefix(build, expectedPrefix), "expected prefix %s in build %s", expectedPrefix, build)
-	assert.LessOrEqual(t, len(build), k8s.MaxBuildIdLen)
+	assert.LessOrEqual(t, len(build), k8s.MaxBuildIDLen)
 	assert.Equalf(t, k8s.TruncateString(build, -1), build, "expected build %s to be truncated", build)
 	split := strings.Split(build, k8s.ResourceNameSeparator)
 	assert.Equalf(t, expectedHashLen, len(split[len(split)-1]), "expected build %s to have %d-digit hash suffix", build, expectedHashLen)
@@ -402,27 +479,50 @@ func TestComputeVersionedDeploymentName(t *testing.T) {
 			buildID:      "image-v2.1.0-a1b2c3d4",
 			expectedName: "worker-name-image-v2-1-0-a1b2c3d4",
 		},
+		{
+			name:         "uppercase characters in build ID are lowercased",
+			baseName:     "worker-name",
+			buildID:      "master--HEAD",
+			expectedName: "worker-name-master--head",
+		},
+		{
+			name:         "exceed max length",
+			baseName:     "worker-name-0123456789-0123456789",
+			buildID:      "image-v2.1.0-0123456789-0123456789",
+			expectedName: "worker-nam-image-v2-1-9c4f60cc97",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := k8s.ComputeVersionedDeploymentName(tt.baseName, tt.buildID)
 			assert.Equal(t, tt.expectedName, result)
-
-			// Verify the format is always baseName-buildID
-			expected := tt.baseName + k8s.ResourceNameSeparator + k8s.CleanStringForDNS(tt.buildID)
-			assert.Equal(t, expected, result)
-
-			// Verify it ends with the build ID
-			assert.True(t, strings.HasSuffix(result, k8s.ResourceNameSeparator+k8s.CleanStringForDNS(tt.buildID)),
-				"versioned deployment name should end with '-cleaned(buildID)'")
-
-			// Verify it starts with the base name
-			assert.True(t, strings.HasPrefix(result, tt.baseName),
-				"versioned deployment name should start with baseName")
-
-			// Verify it is cleaned for DNS
+			assert.LessOrEqual(t, len(result), k8s.MaxDeploymentNameLen)
 			assert.Equal(t, result, k8s.CleanStringForDNS(result))
+
+			if name := tt.baseName + k8s.ResourceNameSeparator + tt.buildID; len(name) <= k8s.MaxDeploymentNameLen {
+				// Verify it ends with the build ID
+				assert.True(t, strings.HasSuffix(result, k8s.ResourceNameSeparator+k8s.CleanStringForDNS(tt.buildID)),
+					"versioned deployment name should end with '-cleaned(buildID)'")
+
+				// Verify it starts with the base name
+				assert.True(t, strings.HasPrefix(result, tt.baseName),
+					"versioned deployment name should start with baseName")
+			} else { // we had to truncate the baseName
+				// Verify it contains the build ID
+				assert.True(t, strings.Contains(result, k8s.ResourceNameSeparator+k8s.CleanStringForDNS(tt.buildID[:10])),
+					"versioned deployment name should end with '-cleaned(buildID)'")
+
+				// Verify it starts with the truncated base name
+				assert.True(t, strings.HasPrefix(result, k8s.CleanStringForDNS(tt.baseName[:10])),
+					"versioned deployment name should start with baseName")
+
+				// Verify it ends with the hash suffix
+				assert.True(t, strings.HasSuffix(result, k8s.ResourceNameSeparator+k8s.HashString(name)[:10]),
+					fmt.Sprintf("versioned deployment name '%s' should end with hash suffix '%s'",
+						result, k8s.HashString(name)))
+			}
+
 		})
 	}
 }
@@ -561,6 +661,166 @@ func TestComputeConnectionSpecHash(t *testing.T) {
 
 		assert.NotEqual(t, hash1, hash2, "Empty vs non-empty mTLS secret should produce different hashes")
 		assert.NotEmpty(t, hash1, "Hash should still be generated even with empty mTLS secret")
+	})
+
+	t.Run("different API key secrets produce different hashes", func(t *testing.T) {
+		spec1 := temporaliov1alpha1.TemporalConnectionSpec{
+			HostPort: "localhost:7233",
+			APIKeySecretRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "secret1"},
+				Key:                  "api-key1"},
+		}
+		spec2 := temporaliov1alpha1.TemporalConnectionSpec{
+			HostPort: "localhost:7233",
+			APIKeySecretRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "secret2"},
+				Key:                  "api-key2"},
+		}
+		hash1 := k8s.ComputeConnectionSpecHash(spec1)
+		hash2 := k8s.ComputeConnectionSpecHash(spec2)
+
+		assert.NotEqual(t, hash1, hash2, "Different API key secrets should produce different hashes")
+	})
+
+	t.Run("empty API key secret vs non-empty produce different hashes", func(t *testing.T) {
+		spec1 := temporaliov1alpha1.TemporalConnectionSpec{
+			HostPort:        "localhost:7233",
+			APIKeySecretRef: nil,
+		}
+		spec2 := temporaliov1alpha1.TemporalConnectionSpec{
+			HostPort: "localhost:7233",
+			APIKeySecretRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "secret"},
+				Key:                  "api-key"},
+		}
+		hash1 := k8s.ComputeConnectionSpecHash(spec1)
+		hash2 := k8s.ComputeConnectionSpecHash(spec2)
+
+		assert.NotEqual(t, hash1, hash2, "Empty vs non-empty API key secret should produce different hashes")
+		assert.NotEmpty(t, hash1, "Hash should still be generated even with empty API key secret")
+	})
+
+	t.Run("same API key secret name produce the same hash", func(t *testing.T) {
+		spec1 := temporaliov1alpha1.TemporalConnectionSpec{
+			HostPort: "localhost:7233",
+			APIKeySecretRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "secret"},
+				Key:                  "api-key"},
+		}
+		spec2 := temporaliov1alpha1.TemporalConnectionSpec{
+			HostPort: "localhost:7233",
+			APIKeySecretRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "secret"},
+				Key:                  "api-key"},
+		}
+
+		hash1 := k8s.ComputeConnectionSpecHash(spec1)
+		hash2 := k8s.ComputeConnectionSpecHash(spec2)
+
+		assert.Equal(t, hash1, hash2, "Same API key secret name should produce the same hash")
+	})
+
+}
+
+func TestComputePodTemplateSpecHash(t *testing.T) {
+	t.Run("generates non-empty hash for valid template", func(t *testing.T) {
+		template := corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{Name: "worker", Image: "test:v1"},
+				},
+			},
+		}
+		result := k8s.ComputePodTemplateSpecHash(template)
+		assert.NotEmpty(t, result)
+		assert.Len(t, result, 64) // SHA256 hex encoded
+	})
+
+	t.Run("is deterministic - same input produces same hash", func(t *testing.T) {
+		template := corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{Name: "worker", Image: "test:v1"},
+				},
+			},
+		}
+		hash1 := k8s.ComputePodTemplateSpecHash(template)
+		hash2 := k8s.ComputePodTemplateSpecHash(template)
+		assert.Equal(t, hash1, hash2)
+	})
+
+	t.Run("different images produce different hashes", func(t *testing.T) {
+		template1 := corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "worker", Image: "test:v1"}},
+			},
+		}
+		template2 := corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "worker", Image: "test:v2"}},
+			},
+		}
+		hash1 := k8s.ComputePodTemplateSpecHash(template1)
+		hash2 := k8s.ComputePodTemplateSpecHash(template2)
+		assert.NotEqual(t, hash1, hash2)
+	})
+
+	t.Run("different env vars produce different hashes", func(t *testing.T) {
+		template1 := corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{Name: "worker", Image: "test:v1", Env: []corev1.EnvVar{{Name: "FOO", Value: "bar"}}},
+				},
+			},
+		}
+		template2 := corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{Name: "worker", Image: "test:v1", Env: []corev1.EnvVar{{Name: "FOO", Value: "baz"}}},
+				},
+			},
+		}
+		hash1 := k8s.ComputePodTemplateSpecHash(template1)
+		hash2 := k8s.ComputePodTemplateSpecHash(template2)
+		assert.NotEqual(t, hash1, hash2)
+	})
+
+	t.Run("different commands produce different hashes", func(t *testing.T) {
+		template1 := corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{Name: "worker", Image: "test:v1", Command: []string{"./old-cmd"}},
+				},
+			},
+		}
+		template2 := corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{Name: "worker", Image: "test:v1", Command: []string{"./new-cmd"}},
+				},
+			},
+		}
+		hash1 := k8s.ComputePodTemplateSpecHash(template1)
+		hash2 := k8s.ComputePodTemplateSpecHash(template2)
+		assert.NotEqual(t, hash1, hash2)
+	})
+
+	t.Run("different volumes produce different hashes", func(t *testing.T) {
+		template1 := corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "worker", Image: "test:v1"}},
+				Volumes:    []corev1.Volume{{Name: "vol1"}},
+			},
+		}
+		template2 := corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "worker", Image: "test:v1"}},
+				Volumes:    []corev1.Volume{{Name: "vol2"}},
+			},
+		}
+		hash1 := k8s.ComputePodTemplateSpecHash(template1)
+		hash2 := k8s.ComputePodTemplateSpecHash(template2)
+		assert.NotEqual(t, hash1, hash2)
 	})
 }
 
@@ -726,6 +986,15 @@ func TestNewDeploymentWithOwnerRef_EnvConfigSDKCompatibility(t *testing.T) {
 			},
 			namespace: "test-namespace-with-tls",
 		},
+		"with API key": {
+			connection: temporaliov1alpha1.TemporalConnectionSpec{
+				HostPort: "test.temporal.example:9999",
+				APIKeySecretRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "test-api-key-secret"},
+					Key:                  "api-key"},
+			},
+			namespace: "test-namespace-with-api-key",
+		},
 	}
 
 	for name, tt := range tests {
@@ -759,7 +1028,7 @@ func TestNewDeploymentWithOwnerRef_EnvConfigSDKCompatibility(t *testing.T) {
 			container := deployment.Spec.Template.Spec.Containers[0]
 
 			// Infer whether TLS is expected from connection spec
-			expectTLS := tt.connection.MutualTLSSecretRef != nil
+			expectTLS := tt.connection.MutualTLSSecretRef != nil || tt.connection.APIKeySecretRef != nil
 
 			if expectTLS {
 				// Create temporary test certificate files
@@ -777,10 +1046,23 @@ func TestNewDeploymentWithOwnerRef_EnvConfigSDKCompatibility(t *testing.T) {
 						container.Env[i].Value = keyPath
 					}
 				}
+			} else if tt.connection.APIKeySecretRef != nil {
+				for i := range container.Env {
+					if container.Env[i].Name == "TEMPORAL_API_KEY" {
+						assert.Equal(t, tt.connection.APIKeySecretRef.Name, container.Env[i].ValueFrom.SecretKeyRef.Name, "API key secret name should match")
+						assert.Equal(t, "api-key", container.Env[i].ValueFrom.SecretKeyRef.Key, "API key secret key should be 'api-key'")
+					}
+				}
 			}
 
 			// Set environment variables using t.Setenv() to simulate the runtime environment
 			for _, env := range container.Env {
+				if env.Name == "TEMPORAL_API_KEY" {
+					// setting a dummy value here since API values are read from an actual secret object in runtime
+					// moreover, env.Value is nil for TEMPORAL_API_KEY since it used the ValueFrom field (check deployments.go)
+					t.Setenv(env.Name, "test-api-key-value")
+					continue
+				}
 				t.Setenv(env.Name, env.Value)
 			}
 
@@ -791,6 +1073,9 @@ func TestNewDeploymentWithOwnerRef_EnvConfigSDKCompatibility(t *testing.T) {
 			// Verify that the parsed client options match our expectations
 			assert.Equal(t, tt.connection.HostPort, clientOptions.HostPort, "HostPort should be parsed from TEMPORAL_ADDRESS")
 			assert.Equal(t, tt.namespace, clientOptions.Namespace, "Namespace should be parsed from TEMPORAL_NAMESPACE")
+			if tt.connection.APIKeySecretRef != nil {
+				assert.Equal(t, "test-api-key-value", os.Getenv("TEMPORAL_API_KEY"), "API key should be parsed from TEMPORAL_API_KEY")
+			}
 
 			// Verify other client option fields that should have default/empty values
 			assert.Empty(t, clientOptions.Identity, "Identity should be empty when not set via env vars")
@@ -800,8 +1085,11 @@ func TestNewDeploymentWithOwnerRef_EnvConfigSDKCompatibility(t *testing.T) {
 
 			if expectTLS {
 				assert.NotNil(t, clientOptions.ConnectionOptions.TLS, "TLS should be configured for mTLS connection")
+			} else if tt.connection.APIKeySecretRef != nil {
+				// An empty TLS config is configured when an API key is used without mTLS secrets
+				assert.Equal(t, clientOptions.ConnectionOptions.TLS, &tls.Config{}, "Empty TLS config should be configured for API key connection")
 			} else {
-				assert.Nil(t, clientOptions.ConnectionOptions.TLS, "TLS should not be configured for non-mTLS connection")
+				assert.Nil(t, clientOptions.ConnectionOptions.TLS, "TLS config should not be configured for non-mTLS connection")
 			}
 
 			// Note: TEMPORAL_DEPLOYMENT_NAME and TEMPORAL_WORKER_BUILD_ID are not part of client options

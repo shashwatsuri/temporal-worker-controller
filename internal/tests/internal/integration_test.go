@@ -9,13 +9,18 @@ import (
 	"github.com/temporalio/temporal-worker-controller/internal/k8s"
 	"github.com/temporalio/temporal-worker-controller/internal/testhelpers"
 	"go.temporal.io/server/common/dynamicconfig"
-	"go.temporal.io/server/common/worker_versioning"
 	"go.temporal.io/server/temporal"
 	"go.temporal.io/server/temporaltest"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 )
+
+type testCase struct {
+	name    string
+	builder *testhelpers.TestCaseBuilder
+}
 
 // TestIntegration runs integration tests for the Temporal Worker Controller
 func TestIntegration(t *testing.T) {
@@ -30,334 +35,920 @@ func TestIntegration(t *testing.T) {
 	// Create test Temporal server and client
 	dc := dynamicconfig.NewMemoryClient()
 	// make versions drain faster
-	dc.OverrideValue("matching.wv.VersionDrainageStatusVisibilityGracePeriod", testDrainageVisibilityGracePeriod)
-	dc.OverrideValue("matching.wv.VersionDrainageStatusRefreshInterval", testDrainageRefreshInterval)
+	dc.OverrideValue(dynamicconfig.MakeKey("matching.wv.VersionDrainageStatusVisibilityGracePeriod"), testDrainageVisibilityGracePeriod)
+	dc.OverrideValue(dynamicconfig.MakeKey("matching.wv.VersionDrainageStatusRefreshInterval"), testDrainageRefreshInterval)
+	dc.OverrideValue(dynamicconfig.MakeKey("matching.maxVersionsInDeployment"), testMaxVersionsInDeployment)
 	ts := temporaltest.NewServer(
 		temporaltest.WithT(t),
 		temporaltest.WithBaseServerOptions(temporal.WithDynamicConfigClient(dc)),
 	)
 
-	tests := map[string]*testhelpers.TestCaseBuilder{
-		"manual-rollout-expect-no-change": testhelpers.NewTestCase().
-			WithInput(
-				testhelpers.NewTemporalWorkerDeploymentBuilder().
-					WithManualStrategy().
-					// Image name with banned characters (slash, colon) that will be replaced
-					// with hyphens in the build ID. Dots and underscores are preserved.
-					WithTargetTemplate("my.app/test/foo_bar:v1.0"),
-			).
-			WithWaitTime(5 * time.Second). // wait before checking to confirm no change
-			WithExpectedStatus(
-				testhelpers.NewStatusBuilder().
-					WithTargetVersion("my.app/test/foo_bar:v1.0", temporaliov1alpha1.VersionStatusInactive, -1, true, false),
-			),
-		"all-at-once-rollout-2-replicas": testhelpers.NewTestCase().
-			WithInput(
-				testhelpers.NewTemporalWorkerDeploymentBuilder().
-					WithAllAtOnceStrategy().
-					WithReplicas(2).
-					WithTargetTemplate("v1.0"),
-			).
-			WithExpectedStatus(
-				testhelpers.NewStatusBuilder().
-					WithTargetVersion("v1.0", temporaliov1alpha1.VersionStatusCurrent, -1, true, false).
-					WithCurrentVersion("v1.0", true, false),
-			),
-		"progressive-rollout-no-unversioned-pollers-expect-all-at-once": testhelpers.NewTestCase().
-			WithInput(
-				testhelpers.NewTemporalWorkerDeploymentBuilder().
-					WithProgressiveStrategy(testhelpers.ProgressiveStep(5, time.Hour)).
-					WithTargetTemplate("v1.0"),
-			).
-			WithExpectedStatus(
-				testhelpers.NewStatusBuilder().
-					WithTargetVersion("v1.0", temporaliov1alpha1.VersionStatusCurrent, -1, true, false).
-					WithCurrentVersion("v1.0", true, false),
-			),
-		"progressive-rollout-yes-unversioned-pollers-expect-first-step": testhelpers.NewTestCase().
-			WithInput(
-				testhelpers.NewTemporalWorkerDeploymentBuilder().
-					WithProgressiveStrategy(testhelpers.ProgressiveStep(5, time.Hour)).
-					WithTargetTemplate("v1"),
-			).
-			WithSetupFunction(setupUnversionedPollers).
-			WithExpectedStatus(
-				testhelpers.NewStatusBuilder().
-					WithTargetVersion("v1", temporaliov1alpha1.VersionStatusRamping, 5, true, false),
-			),
-		"nth-progressive-rollout-expect-first-step": testhelpers.NewTestCase().
-			WithInput(
-				testhelpers.NewTemporalWorkerDeploymentBuilder().
-					WithProgressiveStrategy(testhelpers.ProgressiveStep(5, time.Hour)).
-					WithTargetTemplate("v1.0").
-					WithStatus(
-						testhelpers.NewStatusBuilder().
-							WithTargetVersion("v0", temporaliov1alpha1.VersionStatusCurrent, -1, true, true).
-							WithCurrentVersion("v0", true, true),
-					),
-			).
-			WithExistingDeployments(
-				testhelpers.NewDeploymentInfo("v0", 1),
-			).
-			WithExpectedStatus(
-				testhelpers.NewStatusBuilder().
-					WithTargetVersion("v1.0", temporaliov1alpha1.VersionStatusRamping, 5, true, false),
-			),
-		"nth-progressive-rollout-with-success-gate": testhelpers.NewTestCase().
-			WithInput(
-				testhelpers.NewTemporalWorkerDeploymentBuilder().
-					WithProgressiveStrategy(testhelpers.ProgressiveStep(5, time.Hour)).
-					WithGate(true).
-					WithTargetTemplate("v1.0").
-					WithStatus(
-						testhelpers.NewStatusBuilder().
-							WithTargetVersion("v0", temporaliov1alpha1.VersionStatusCurrent, -1, true, true).
-							WithCurrentVersion("v0", true, true),
-					),
-			).
-			WithExistingDeployments(
-				testhelpers.NewDeploymentInfo("v0", 1),
-			).
-			WithExpectedStatus(
-				testhelpers.NewStatusBuilder().
-					WithTargetVersion("v1.0", temporaliov1alpha1.VersionStatusRamping, 5, true, false),
-			),
-		"nth-progressive-rollout-with-failed-gate": testhelpers.NewTestCase().
-			WithInput(
-				testhelpers.NewTemporalWorkerDeploymentBuilder().
-					WithProgressiveStrategy(testhelpers.ProgressiveStep(5, time.Hour)).
-					WithGate(false).
-					WithTargetTemplate("v1.0").
-					WithStatus(
-						testhelpers.NewStatusBuilder().
-							WithTargetVersion("v0", temporaliov1alpha1.VersionStatusCurrent, -1, true, true).
-							WithCurrentVersion("v0", true, true),
-					),
-			).
-			WithExistingDeployments(
-				testhelpers.NewDeploymentInfo("v0", 1),
-			).
-			WithWaitTime(5 * time.Second).
-			WithExpectedStatus(
-				testhelpers.NewStatusBuilder().
-					WithTargetVersion("v1.0", temporaliov1alpha1.VersionStatusInactive, -1, true, false).
-					WithCurrentVersion("v0", true, true),
-			),
-		"failed-gate-is-not-scaled-down-while-target": testhelpers.NewTestCase().
-			WithInput(
-				testhelpers.NewTemporalWorkerDeploymentBuilder().
-					WithAllAtOnceStrategy().
-					WithGate(false).
-					WithTargetTemplate("v1.0"),
-			).
-			WithWaitTime(5 * time.Second).
-			WithExpectedStatus(
-				testhelpers.NewStatusBuilder().
-					WithTargetVersion("v1.0", temporaliov1alpha1.VersionStatusInactive, -1, true, false),
-			),
-		"failed-gate-is-scaled-down-when-deprecated": testhelpers.NewTestCase().
-			WithInput(
-				testhelpers.NewTemporalWorkerDeploymentBuilder().
-					WithAllAtOnceStrategy().
-					WithTargetTemplate("v2.0").
-					WithStatus(
-						testhelpers.NewStatusBuilder().
-							WithTargetVersion("v1.0", temporaliov1alpha1.VersionStatusInactive, -1, true, true).
-							WithDeprecatedVersions(
-								testhelpers.NewDeprecatedVersionInfo("v0", temporaliov1alpha1.VersionStatusDrained, true, true, true),
-							),
-					),
-			).
-			WithExistingDeployments(
-				testhelpers.NewDeploymentInfo("v0", 1),
-				testhelpers.NewDeploymentInfo("v1.0", 1),
-			).
-			WithWaitTime(5*time.Second).
-			WithExpectedStatus(
-				testhelpers.NewStatusBuilder().
-					WithTargetVersion("v2.0", temporaliov1alpha1.VersionStatusCurrent, -1, true, false).
-					WithCurrentVersion("v2.0", true, false).
-					WithDeprecatedVersions(
-						testhelpers.NewDeprecatedVersionInfo("v0", temporaliov1alpha1.VersionStatusDrained, true, false, true),
-						testhelpers.NewDeprecatedVersionInfo("v1.0", temporaliov1alpha1.VersionStatusInactive, true, false, true),
-					),
-			).
-			WithExpectedDeployments( // note: right now this is only checked for deprecated versions, TODO(carlydf) add for non-deprecated too
-				testhelpers.NewDeploymentInfo("v0", 1),
-				testhelpers.NewDeploymentInfo("v1.0", 0),
-				testhelpers.NewDeploymentInfo("v2.0", 1),
-			),
-		"nth-rollout-blocked-at-max-replicas": testhelpers.NewTestCase().
-			WithInput(
-				testhelpers.NewTemporalWorkerDeploymentBuilder().
-					WithAllAtOnceStrategy().
-					WithTargetTemplate("v5").
-					WithStatus(
-						testhelpers.NewStatusBuilder().
-							WithTargetVersion("v4", temporaliov1alpha1.VersionStatusCurrent, -1, true, true).
-							WithCurrentVersion("v4", true, true).
-							WithDeprecatedVersions( // drained AND has no pollers -> eligible for deletion
-								testhelpers.NewDeprecatedVersionInfo("v0", temporaliov1alpha1.VersionStatusDrained, true, true, true),
-								testhelpers.NewDeprecatedVersionInfo("v1", temporaliov1alpha1.VersionStatusDrained, true, true, true),
-								testhelpers.NewDeprecatedVersionInfo("v2", temporaliov1alpha1.VersionStatusDrained, true, true, true),
-								testhelpers.NewDeprecatedVersionInfo("v3", temporaliov1alpha1.VersionStatusDrained, true, true, true),
-							),
-					),
-			).
-			WithExistingDeployments(
-				testhelpers.NewDeploymentInfo("v0", 1),
-				testhelpers.NewDeploymentInfo("v1", 1),
-				testhelpers.NewDeploymentInfo("v2", 1),
-				testhelpers.NewDeploymentInfo("v3", 1),
-				testhelpers.NewDeploymentInfo("v4", 1),
-			).
-			WithWaitTime(5*time.Second).
-			WithExpectedStatus(
-				testhelpers.NewStatusBuilder(). // controller won't deploy v5, so it's not registered
-								WithTargetVersion("v5", temporaliov1alpha1.VersionStatusNotRegistered, -1, false, false).
-								WithCurrentVersion("v4", true, false).
-								WithDeprecatedVersions( // drained but has pollers, so ineligible for deletion
-						testhelpers.NewDeprecatedVersionInfo("v0", temporaliov1alpha1.VersionStatusDrained, true, false, true),
-						testhelpers.NewDeprecatedVersionInfo("v1", temporaliov1alpha1.VersionStatusDrained, true, false, true),
-						testhelpers.NewDeprecatedVersionInfo("v2", temporaliov1alpha1.VersionStatusDrained, true, false, true),
-						testhelpers.NewDeprecatedVersionInfo("v3", temporaliov1alpha1.VersionStatusDrained, true, false, true),
-					),
-			).
-			WithExpectedDeployments(
-				testhelpers.NewDeploymentInfo("v0", 1),
-				testhelpers.NewDeploymentInfo("v1", 1),
-				testhelpers.NewDeploymentInfo("v2", 1),
-				testhelpers.NewDeploymentInfo("v3", 1),
-				testhelpers.NewDeploymentInfo("v4", 1),
-				testhelpers.NewDeploymentInfo("v5", 1),
-			),
-		"nth-rollout-blocked-by-modifier": testhelpers.NewTestCase().
-			WithInput(
-				testhelpers.NewTemporalWorkerDeploymentBuilder().
-					WithAllAtOnceStrategy().
-					WithTargetTemplate("v1").
-					WithStatus(
-						testhelpers.NewStatusBuilder().
-							WithTargetVersion("v0", temporaliov1alpha1.VersionStatusCurrent, -1, true, true).
-							WithCurrentVersion("v0", true, true),
-					),
-			).
-			WithExistingDeployments(
-				testhelpers.NewDeploymentInfo("v0", 1),
-			).
-			WithWaitTime(5 * time.Second).
-			WithSetupFunction(setUnversionedCurrent).
-			WithExpectedStatus(
-				testhelpers.NewStatusBuilder().
-					WithTargetVersion("v1", temporaliov1alpha1.VersionStatusInactive, -1, true, false).
-					WithCurrentVersion(worker_versioning.UnversionedVersionId, false, false).
-					WithDeprecatedVersions(testhelpers.NewDeprecatedVersionInfo("v0", temporaliov1alpha1.VersionStatusDrained, true, false, true)),
-			).
-			WithExpectedDeployments(
-				testhelpers.NewDeploymentInfo("v0", 1),
-			).
-			WithValidatorFunction(validateIgnoreLastModifierMetadata(false)),
-		"nth-rollout-unblocked-by-modifier-with-ignore": testhelpers.NewTestCase().
-			WithInput(
-				testhelpers.NewTemporalWorkerDeploymentBuilder().
-					WithAllAtOnceStrategy().
-					WithTargetTemplate("v1").
-					WithStatus(
-						testhelpers.NewStatusBuilder().
-							WithTargetVersion("v0", temporaliov1alpha1.VersionStatusCurrent, -1, true, true).
-							WithCurrentVersion("v0", true, true),
-					),
-			).
-			WithExistingDeployments(
-				testhelpers.NewDeploymentInfo("v0", 1),
-			).
-			WithSetupFunction(setCurrentAndSetIgnoreModifierMetadata).
-			WithExpectedStatus(
-				testhelpers.NewStatusBuilder().
-					WithTargetVersion("v1", temporaliov1alpha1.VersionStatusCurrent, -1, true, false).
-					WithDeprecatedVersions(testhelpers.NewDeprecatedVersionInfo("v0", temporaliov1alpha1.VersionStatusDrained, true, false, true)),
-			).
-			WithExpectedDeployments(
-				testhelpers.NewDeploymentInfo("v0", 1),
-			).
-			WithValidatorFunction(validateIgnoreLastModifierMetadata(false)),
-	}
-	// TODO(carlydf): Add additional test case where multiple ramping steps are done
+	// These tests are categorized by the three different rollout strategies the controller supports.
 
-	for testName, tc := range tests {
-		t.Run(testName, func(t *testing.T) {
+	// Manual strategy tests
+	manualStrategyTestCases := []testCase{
+		{
+			name: "manual-rollout-expect-no-change",
+			builder: testhelpers.NewTestCase().
+				WithInput(
+					testhelpers.NewTemporalWorkerDeploymentBuilder().
+						WithManualStrategy().
+						// Image name with banned characters (slash, colon) that will be replaced
+						// with hyphens in the build ID. Dots and underscores are preserved.
+						WithTargetTemplate("my.app/test/foo_bar:v1.0"),
+				).
+				WithWaitTime(5 * time.Second). // wait before checking to confirm no change
+				WithExpectedStatus(
+					testhelpers.NewStatusBuilder().
+						WithTargetVersion("my.app/test/foo_bar:v1.0", temporaliov1alpha1.VersionStatusInactive, -1, true, false),
+				),
+		},
+		{
+			name: "manual-rollout-with-failed-gate-expect-no-current",
+			builder: testhelpers.NewTestCase().
+				WithInput(
+					testhelpers.NewTemporalWorkerDeploymentBuilder().
+						WithManualStrategy().
+						WithGate(false).
+						WithReplicas(2).
+						WithTargetTemplate("v1.0"),
+				).
+				WithExpectedStatus(
+					testhelpers.NewStatusBuilder().
+						WithTargetVersion("v1.0", temporaliov1alpha1.VersionStatusInactive, -1, true, false),
+				),
+		},
+		{
+			name: "manual-rollout-with-success-gate-expect-no-current",
+			builder: testhelpers.NewTestCase().
+				WithInput(
+					testhelpers.NewTemporalWorkerDeploymentBuilder().
+						WithManualStrategy().
+						WithGate(true).
+						WithReplicas(2).
+						WithTargetTemplate("v1.0"),
+				).
+				WithExpectedStatus(
+					testhelpers.NewStatusBuilder().
+						WithTargetVersion("v1.0", temporaliov1alpha1.VersionStatusInactive, -1, true, false),
+				),
+		},
+		{
+			name: "manual-rollout-expect-deployments-scaled-up",
+			builder: testhelpers.NewTestCase().
+				WithInput(
+					testhelpers.NewTemporalWorkerDeploymentBuilder().
+						WithManualStrategy().
+						WithReplicas(2).
+						WithTargetTemplate("v1.0"),
+				).
+				WithExpectedStatus(
+					testhelpers.NewStatusBuilder().
+						WithTargetVersion("v1.0", temporaliov1alpha1.VersionStatusInactive, -1, true, false),
+				),
+		},
+		{
+			name: "manual-rollout-custom-build-expect-rolling-update", // due to pod spec change
+			builder: testhelpers.NewTestCase().
+				WithInput(
+					testhelpers.NewTemporalWorkerDeploymentBuilder().
+						WithManualStrategy().
+						WithReplicas(1).
+						WithTargetTemplate("v1.1"). // new image, same stable build id
+						WithUnsafeCustomBuildID("custom-build").
+						WithStatus( // there was already an inactive deployment there with a different image name
+							testhelpers.NewStatusBuilder().
+								WithTargetVersionWithCustomBuild("v1.0", "custom-build", temporaliov1alpha1.VersionStatusInactive, -1, true, true),
+						),
+				).
+				WithExistingDeployments(
+					testhelpers.NewDeploymentInfoWithUnsafeCustomBuildID("v1.0", "custom-build", 1),
+				).
+				WithWaitTime(5 * time.Second).
+				WithExpectedStatus(
+					testhelpers.NewStatusBuilder().
+						WithTargetVersionWithCustomBuild("v1.1", "custom-build", temporaliov1alpha1.VersionStatusInactive, -1, true, false),
+				),
+		},
+		{
+			name: "manual-rollout-scale-down-deprecated-versions",
+			builder: testhelpers.NewTestCase().
+				WithInput(
+					testhelpers.NewTemporalWorkerDeploymentBuilder().
+						WithManualStrategy().
+						WithTargetTemplate("v2.0").
+						WithStatus(
+							testhelpers.NewStatusBuilder().
+								WithTargetVersion("v1.0", temporaliov1alpha1.VersionStatusInactive, -1, true, true).
+								WithDeprecatedVersions(
+									testhelpers.NewDeprecatedVersionInfo("v0", temporaliov1alpha1.VersionStatusDrained, true, true, true),
+								),
+						),
+				).
+				WithExistingDeployments(
+					testhelpers.NewDeploymentInfo("v0", 1),
+					testhelpers.NewDeploymentInfo("v1.0", 1),
+				).
+				WithWaitTime(5*time.Second).
+				WithExpectedStatus(
+					testhelpers.NewStatusBuilder().
+						WithTargetVersion("v2.0", temporaliov1alpha1.VersionStatusInactive, -1, true, false).
+						WithDeprecatedVersions(
+							testhelpers.NewDeprecatedVersionInfo("v0", temporaliov1alpha1.VersionStatusDrained, true, false, true),
+							testhelpers.NewDeprecatedVersionInfo("v1.0", temporaliov1alpha1.VersionStatusInactive, true, false, true),
+						),
+				).
+				WithExpectedDeployments( // note: right now this is only checked for deprecated versions, TODO(carlydf) add for non-deprecated too
+					testhelpers.NewDeploymentInfo("v0", 1),
+					testhelpers.NewDeploymentInfo("v1.0", 0),
+					testhelpers.NewDeploymentInfo("v2.0", 1),
+				),
+		},
+		{
+			name: "manual-rollout-yes-unversioned-pollers-expect-no-current",
+			builder: testhelpers.NewTestCase().
+				WithInput(
+					testhelpers.NewTemporalWorkerDeploymentBuilder().
+						WithManualStrategy().
+						WithTargetTemplate("v1"),
+				).
+				WithSetupFunction(setupUnversionedPollers).
+				WithExpectedStatus(
+					testhelpers.NewStatusBuilder().
+						WithTargetVersion("v1", temporaliov1alpha1.VersionStatusInactive, -1, true, false),
+				),
+		},
+		{
+			name: "manual-rollout-blocked-at-max-versions-ineligible-for-deletion",
+			builder: testhelpers.NewTestCase().
+				WithInput(
+					testhelpers.NewTemporalWorkerDeploymentBuilder().
+						WithManualStrategy().
+						WithTargetTemplate("v5").
+						WithStatus(
+							testhelpers.NewStatusBuilder().
+								WithTargetVersion("v4", temporaliov1alpha1.VersionStatusCurrent, -1, true, true).
+								WithCurrentVersion("v4", true, true).
+								WithDeprecatedVersions( // drained AND has no pollers -> eligible for deletion
+									testhelpers.NewDeprecatedVersionInfo("v0", temporaliov1alpha1.VersionStatusDrained, true, true, true),
+									testhelpers.NewDeprecatedVersionInfo("v1", temporaliov1alpha1.VersionStatusDrained, true, true, true),
+									testhelpers.NewDeprecatedVersionInfo("v2", temporaliov1alpha1.VersionStatusDrained, true, true, true),
+									testhelpers.NewDeprecatedVersionInfo("v3", temporaliov1alpha1.VersionStatusDrained, true, true, true),
+								),
+						),
+				).
+				WithExistingDeployments(
+					testhelpers.NewDeploymentInfo("v0", 1),
+					testhelpers.NewDeploymentInfo("v1", 1),
+					testhelpers.NewDeploymentInfo("v2", 1),
+					testhelpers.NewDeploymentInfo("v3", 1),
+					testhelpers.NewDeploymentInfo("v4", 1),
+				).
+				WithWaitTime(5*time.Second).
+				WithExpectedStatus(
+					testhelpers.NewStatusBuilder(). // controller won't deploy v5, so it's not registered
+									WithTargetVersion("v5", temporaliov1alpha1.VersionStatusNotRegistered, -1, false, false).
+									WithCurrentVersion("v4", true, false).
+									WithDeprecatedVersions( // drained but has pollers, so ineligible for deletion
+							testhelpers.NewDeprecatedVersionInfo("v0", temporaliov1alpha1.VersionStatusDrained, true, false, true),
+							testhelpers.NewDeprecatedVersionInfo("v1", temporaliov1alpha1.VersionStatusDrained, true, false, true),
+							testhelpers.NewDeprecatedVersionInfo("v2", temporaliov1alpha1.VersionStatusDrained, true, false, true),
+							testhelpers.NewDeprecatedVersionInfo("v3", temporaliov1alpha1.VersionStatusDrained, true, false, true),
+						),
+				).
+				WithExpectedDeployments(
+					testhelpers.NewDeploymentInfo("v0", 1),
+					testhelpers.NewDeploymentInfo("v1", 1),
+					testhelpers.NewDeploymentInfo("v2", 1),
+					testhelpers.NewDeploymentInfo("v3", 1),
+					testhelpers.NewDeploymentInfo("v4", 1),
+					testhelpers.NewDeploymentInfo("v5", 1),
+				),
+		},
+		{
+			name: "manual-rollout-blocked-by-manager-identity",
+			builder: testhelpers.NewTestCase().
+				WithInput(
+					testhelpers.NewTemporalWorkerDeploymentBuilder().
+						WithManualStrategy().
+						WithTargetTemplate("v1").
+						WithStatus(
+							testhelpers.NewStatusBuilder().
+								WithTargetVersion("v0", temporaliov1alpha1.VersionStatusCurrent, -1, true, true).
+								WithCurrentVersion("v0", true, true),
+						),
+				).
+				WithExistingDeployments(
+					testhelpers.NewDeploymentInfo("v0", 1),
+				).
+				WithWaitTime(5 * time.Second).
+				WithSetupFunction(setManagerIdentityToOther).
+				WithExpectedStatus(
+					testhelpers.NewStatusBuilder().
+						WithTargetVersion("v1", temporaliov1alpha1.VersionStatusInactive, -1, true, false).
+						WithCurrentVersion("v0", true, false),
+				).
+				WithExpectedDeployments(
+					testhelpers.NewDeploymentInfo("v0", 1),
+				).
+				WithValidatorFunction(validateManagerIdentity("some-other-cli-user")),
+		},
+		{
+			name: "manual-rollout-unblocked-after-manager-identity-cleared",
+			builder: testhelpers.NewTestCase().
+				WithInput(
+					testhelpers.NewTemporalWorkerDeploymentBuilder().
+						WithManualStrategy().
+						WithTargetTemplate("v1").
+						WithStatus(
+							testhelpers.NewStatusBuilder().
+								WithTargetVersion("v0", temporaliov1alpha1.VersionStatusCurrent, -1, true, true).
+								WithCurrentVersion("v0", true, true),
+						),
+				).
+				WithExistingDeployments(
+					testhelpers.NewDeploymentInfo("v0", 1),
+				).
+				WithSetupFunction(setManagerIdentityBlockThenUnblock).
+				WithExpectedStatus(
+					testhelpers.NewStatusBuilder().
+						WithTargetVersion("v1", temporaliov1alpha1.VersionStatusInactive, -1, true, false). // manual strategy, so controller should not promote v1 to current
+						WithCurrentVersion("v0", true, false),
+				).
+				WithExpectedDeployments(
+					testhelpers.NewDeploymentInfo("v0", 1),
+				),
+		},
+	}
+
+	for _, tc := range manualStrategyTestCases {
+		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
-			testTemporalWorkerDeploymentCreation(ctx, t, k8sClient, mgr, ts, tc.BuildWithValues(testName, testNamespace.Name, ts.GetDefaultNamespace()))
+			testTemporalWorkerDeploymentCreation(ctx, t, k8sClient, mgr, ts, tc.builder.BuildWithValues(tc.name, testNamespace.Name, ts.GetDefaultNamespace()))
+		})
+	}
+
+	// All-at-once strategy tests
+	allAtOnceStrategyTestCases := []testCase{
+		{
+			name: "all-at-once-with-success-gate-expect-current",
+			builder: testhelpers.NewTestCase().
+				WithInput(
+					testhelpers.NewTemporalWorkerDeploymentBuilder().
+						WithAllAtOnceStrategy().
+						WithGate(true).
+						WithReplicas(2).
+						WithTargetTemplate("v1.0"),
+				).
+				WithExpectedStatus(
+					testhelpers.NewStatusBuilder().
+						WithTargetVersion("v1.0", temporaliov1alpha1.VersionStatusCurrent, -1, true, false).
+						WithCurrentVersion("v1.0", true, false),
+				),
+		},
+		{
+			name: "all-at-once-rollout-with-failed-gate-expect-no-current",
+			builder: testhelpers.NewTestCase().
+				WithInput(
+					testhelpers.NewTemporalWorkerDeploymentBuilder().
+						WithAllAtOnceStrategy().
+						WithGate(false).
+						WithTargetTemplate("v1.0").
+						WithStatus(
+							testhelpers.NewStatusBuilder().
+								WithTargetVersion("v0", temporaliov1alpha1.VersionStatusCurrent, -1, true, true).
+								WithCurrentVersion("v0", true, true),
+						),
+				).
+				WithExistingDeployments(
+					testhelpers.NewDeploymentInfo("v0", 1),
+				).
+				WithExpectedStatus(
+					testhelpers.NewStatusBuilder().
+						WithTargetVersion("v1.0", temporaliov1alpha1.VersionStatusInactive, -1, true, false),
+				),
+		},
+		{
+			name: "all-at-once-expect-scale-down-deprecated-versions",
+			builder: testhelpers.NewTestCase().
+				WithInput(
+					testhelpers.NewTemporalWorkerDeploymentBuilder().
+						WithAllAtOnceStrategy().
+						WithTargetTemplate("v2.0").
+						WithStatus(
+							testhelpers.NewStatusBuilder().
+								WithTargetVersion("v1.0", temporaliov1alpha1.VersionStatusInactive, -1, true, true).
+								WithDeprecatedVersions(
+									testhelpers.NewDeprecatedVersionInfo("v0", temporaliov1alpha1.VersionStatusDrained, true, true, true),
+								),
+						),
+				).
+				WithExistingDeployments(
+					testhelpers.NewDeploymentInfo("v0", 1),
+					testhelpers.NewDeploymentInfo("v1.0", 1),
+				).
+				WithWaitTime(5*time.Second).
+				WithExpectedStatus(
+					testhelpers.NewStatusBuilder().
+						WithTargetVersion("v2.0", temporaliov1alpha1.VersionStatusCurrent, -1, true, false).
+						WithDeprecatedVersions(
+							testhelpers.NewDeprecatedVersionInfo("v0", temporaliov1alpha1.VersionStatusDrained, true, false, true),
+							testhelpers.NewDeprecatedVersionInfo("v1.0", temporaliov1alpha1.VersionStatusInactive, true, false, true),
+						),
+				).
+				WithExpectedDeployments( // note: right now this is only checked for deprecated versions, TODO(carlydf) add for non-deprecated too
+					testhelpers.NewDeploymentInfo("v0", 1),
+					testhelpers.NewDeploymentInfo("v1.0", 0),
+					testhelpers.NewDeploymentInfo("v2.0", 1),
+				),
+		},
+		{
+			name: "all-at-once-yes-unversioned-pollers-expect-current",
+			builder: testhelpers.NewTestCase().
+				WithInput(
+					testhelpers.NewTemporalWorkerDeploymentBuilder().
+						WithAllAtOnceStrategy().
+						WithTargetTemplate("v1"),
+				).
+				WithSetupFunction(setupUnversionedPollers).
+				WithExpectedStatus(
+					testhelpers.NewStatusBuilder().
+						WithTargetVersion("v1", temporaliov1alpha1.VersionStatusCurrent, -1, true, false),
+				),
+		},
+		{
+			name: "all-at-once-blocked-at-max-versions-ineligible-for-deletion",
+			builder: testhelpers.NewTestCase().
+				WithInput(
+					testhelpers.NewTemporalWorkerDeploymentBuilder().
+						WithAllAtOnceStrategy().
+						WithTargetTemplate("v5").
+						WithStatus(
+							testhelpers.NewStatusBuilder().
+								WithTargetVersion("v4", temporaliov1alpha1.VersionStatusCurrent, -1, true, true).
+								WithCurrentVersion("v4", true, true).
+								WithDeprecatedVersions( // drained AND has no pollers -> eligible for deletion
+									testhelpers.NewDeprecatedVersionInfo("v0", temporaliov1alpha1.VersionStatusDrained, true, true, true),
+									testhelpers.NewDeprecatedVersionInfo("v1", temporaliov1alpha1.VersionStatusDrained, true, true, true),
+									testhelpers.NewDeprecatedVersionInfo("v2", temporaliov1alpha1.VersionStatusDrained, true, true, true),
+									testhelpers.NewDeprecatedVersionInfo("v3", temporaliov1alpha1.VersionStatusDrained, true, true, true),
+								),
+						),
+				).
+				WithExistingDeployments(
+					testhelpers.NewDeploymentInfo("v0", 1),
+					testhelpers.NewDeploymentInfo("v1", 1),
+					testhelpers.NewDeploymentInfo("v2", 1),
+					testhelpers.NewDeploymentInfo("v3", 1),
+					testhelpers.NewDeploymentInfo("v4", 1),
+				).
+				WithWaitTime(5*time.Second).
+				WithExpectedStatus(
+					testhelpers.NewStatusBuilder(). // controller won't deploy v5, so it's not registered
+									WithTargetVersion("v5", temporaliov1alpha1.VersionStatusNotRegistered, -1, false, false).
+									WithCurrentVersion("v4", true, false).
+									WithDeprecatedVersions( // drained but has pollers, so ineligible for deletion
+							testhelpers.NewDeprecatedVersionInfo("v0", temporaliov1alpha1.VersionStatusDrained, true, false, true),
+							testhelpers.NewDeprecatedVersionInfo("v1", temporaliov1alpha1.VersionStatusDrained, true, false, true),
+							testhelpers.NewDeprecatedVersionInfo("v2", temporaliov1alpha1.VersionStatusDrained, true, false, true),
+							testhelpers.NewDeprecatedVersionInfo("v3", temporaliov1alpha1.VersionStatusDrained, true, false, true),
+						),
+				).
+				WithExpectedDeployments(
+					testhelpers.NewDeploymentInfo("v0", 1),
+					testhelpers.NewDeploymentInfo("v1", 1),
+					testhelpers.NewDeploymentInfo("v2", 1),
+					testhelpers.NewDeploymentInfo("v3", 1),
+					testhelpers.NewDeploymentInfo("v4", 1),
+					testhelpers.NewDeploymentInfo("v5", 1),
+				),
+		},
+		{
+			name: "all-at-once-rollout-blocked-by-manager-identity",
+			builder: testhelpers.NewTestCase().
+				WithInput(
+					testhelpers.NewTemporalWorkerDeploymentBuilder().
+						WithAllAtOnceStrategy().
+						WithTargetTemplate("v1").
+						WithStatus(
+							testhelpers.NewStatusBuilder().
+								WithTargetVersion("v0", temporaliov1alpha1.VersionStatusCurrent, -1, true, true).
+								WithCurrentVersion("v0", true, true),
+						),
+				).
+				WithExistingDeployments(
+					testhelpers.NewDeploymentInfo("v0", 1),
+				).
+				WithWaitTime(5 * time.Second).
+				WithSetupFunction(setManagerIdentityToOther).
+				WithExpectedStatus(
+					testhelpers.NewStatusBuilder().
+						WithTargetVersion("v1", temporaliov1alpha1.VersionStatusInactive, -1, true, false).
+						WithCurrentVersion("v0", true, false),
+				).
+				WithExpectedDeployments(
+					testhelpers.NewDeploymentInfo("v0", 1),
+				).
+				WithValidatorFunction(validateManagerIdentity("some-other-cli-user")),
+		},
+		{
+			name: "all-at-once-unblocked-after-manager-identity-cleared",
+			builder: testhelpers.NewTestCase().
+				WithInput(
+					testhelpers.NewTemporalWorkerDeploymentBuilder().
+						WithAllAtOnceStrategy().
+						WithTargetTemplate("v1").
+						WithStatus(
+							testhelpers.NewStatusBuilder().
+								WithTargetVersion("v0", temporaliov1alpha1.VersionStatusCurrent, -1, true, true).
+								WithCurrentVersion("v0", true, true),
+						),
+				).
+				WithExistingDeployments(
+					testhelpers.NewDeploymentInfo("v0", 1),
+				).
+				WithSetupFunction(setManagerIdentityBlockThenUnblock).
+				WithExpectedStatus(
+					testhelpers.NewStatusBuilder().
+						WithTargetVersion("v1", temporaliov1alpha1.VersionStatusCurrent, -1, true, false).
+						WithCurrentVersion("v1", true, false).
+						WithDeprecatedVersions(testhelpers.NewDeprecatedVersionInfo("v0", temporaliov1alpha1.VersionStatusDrained, true, false, true)),
+				).
+				WithExpectedDeployments(
+					testhelpers.NewDeploymentInfo("v0", 1),
+				),
+		},
+	}
+
+	for _, tc := range allAtOnceStrategyTestCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			testTemporalWorkerDeploymentCreation(ctx, t, k8sClient, mgr, ts, tc.builder.BuildWithValues(tc.name, testNamespace.Name, ts.GetDefaultNamespace()))
+		})
+	}
+
+	progressiveStrategyTestCases := []testCase{
+		{
+			name: "progressive-rollout-with-gate-no-current-expect-all-at-once",
+			builder: testhelpers.NewTestCase().
+				WithInput(
+					testhelpers.NewTemporalWorkerDeploymentBuilder().
+						WithProgressiveStrategy(testhelpers.ProgressiveStep(10, time.Hour)).
+						WithReplicas(2).
+						WithGate(true).
+						WithTargetTemplate("v1.0"),
+				).
+				WithExpectedStatus(
+					testhelpers.NewStatusBuilder().
+						WithTargetVersion("v1.0", temporaliov1alpha1.VersionStatusCurrent, -1, true, false).
+						WithCurrentVersion("v1.0", true, false),
+				),
+		},
+		{
+			name: "progressive-rollout-no-unversioned-pollers-expect-all-at-once",
+			builder: testhelpers.NewTestCase().
+				WithInput(
+					testhelpers.NewTemporalWorkerDeploymentBuilder().
+						WithProgressiveStrategy(testhelpers.ProgressiveStep(5, time.Hour)).
+						WithTargetTemplate("v1.0"),
+				).
+				WithExpectedStatus(
+					testhelpers.NewStatusBuilder().
+						WithTargetVersion("v1.0", temporaliov1alpha1.VersionStatusCurrent, -1, true, false).
+						WithCurrentVersion("v1.0", true, false),
+				),
+		},
+		{
+			name: "progressive-rollout-yes-unversioned-pollers-expect-first-step",
+			builder: testhelpers.NewTestCase().
+				WithInput(
+					testhelpers.NewTemporalWorkerDeploymentBuilder().
+						WithProgressiveStrategy(testhelpers.ProgressiveStep(5, time.Hour)).
+						WithTargetTemplate("v1"),
+				).
+				WithSetupFunction(setupUnversionedPollers).
+				WithExpectedStatus(
+					testhelpers.NewStatusBuilder().
+						WithTargetVersion("v1", temporaliov1alpha1.VersionStatusRamping, 5, true, false),
+				),
+		},
+		{
+			name: "progressive-rollout-expect-first-step",
+			builder: testhelpers.NewTestCase().
+				WithInput(
+					testhelpers.NewTemporalWorkerDeploymentBuilder().
+						WithProgressiveStrategy(testhelpers.ProgressiveStep(5, time.Hour)).
+						WithTargetTemplate("v1.0").
+						WithStatus(
+							testhelpers.NewStatusBuilder().
+								WithTargetVersion("v0", temporaliov1alpha1.VersionStatusCurrent, -1, true, true).
+								WithCurrentVersion("v0", true, true),
+						),
+				).
+				WithExistingDeployments(
+					testhelpers.NewDeploymentInfo("v0", 1),
+				).
+				WithExpectedStatus(
+					testhelpers.NewStatusBuilder().
+						WithTargetVersion("v1.0", temporaliov1alpha1.VersionStatusRamping, 5, true, false).
+						WithCurrentVersion("v0", true, true),
+				),
+		},
+		{
+			name: "progressive-rollout-success-gate-expect-first-step",
+			builder: testhelpers.NewTestCase().
+				WithInput(
+					testhelpers.NewTemporalWorkerDeploymentBuilder().
+						WithProgressiveStrategy(testhelpers.ProgressiveStep(5, time.Hour)).
+						WithGate(true).
+						WithTargetTemplate("v1.0").
+						WithStatus(
+							testhelpers.NewStatusBuilder().
+								WithTargetVersion("v0", temporaliov1alpha1.VersionStatusCurrent, -1, true, true).
+								WithCurrentVersion("v0", true, true),
+						),
+				).
+				WithExistingDeployments(
+					testhelpers.NewDeploymentInfo("v0", 1),
+				).
+				WithExpectedStatus(
+					testhelpers.NewStatusBuilder().
+						WithTargetVersion("v1.0", temporaliov1alpha1.VersionStatusRamping, 5, true, false).
+						WithCurrentVersion("v0", true, true),
+				),
+		},
+		{
+			name: "progressive-rollout-with-failed-gate",
+			builder: testhelpers.NewTestCase().
+				WithInput(
+					testhelpers.NewTemporalWorkerDeploymentBuilder().
+						WithProgressiveStrategy(testhelpers.ProgressiveStep(5, time.Hour)).
+						WithGate(false).
+						WithTargetTemplate("v1.0").
+						WithStatus(
+							testhelpers.NewStatusBuilder().
+								WithTargetVersion("v0", temporaliov1alpha1.VersionStatusCurrent, -1, true, true).
+								WithCurrentVersion("v0", true, true),
+						),
+				).
+				WithExistingDeployments(
+					testhelpers.NewDeploymentInfo("v0", 1),
+				).
+				WithWaitTime(5 * time.Second).
+				WithExpectedStatus(
+					testhelpers.NewStatusBuilder().
+						WithTargetVersion("v1.0", temporaliov1alpha1.VersionStatusInactive, -1, true, false).
+						WithCurrentVersion("v0", true, true),
+				),
+		},
+		{
+			name: "progressive-rollout-blocked-at-ctrlr-max-versions",
+			builder: testhelpers.NewTestCase().
+				WithInput(
+					testhelpers.NewTemporalWorkerDeploymentBuilder().
+						WithProgressiveStrategy(testhelpers.ProgressiveStep(5, time.Hour)).
+						WithTargetTemplate("v5").
+						WithStatus(
+							testhelpers.NewStatusBuilder().
+								WithTargetVersion("v4", temporaliov1alpha1.VersionStatusCurrent, -1, true, true).
+								WithCurrentVersion("v4", true, true).
+								WithDeprecatedVersions( // drained AND has no pollers -> eligible for deletion
+									testhelpers.NewDeprecatedVersionInfo("v0", temporaliov1alpha1.VersionStatusDrained, true, true, true),
+									testhelpers.NewDeprecatedVersionInfo("v1", temporaliov1alpha1.VersionStatusDrained, true, true, true),
+									testhelpers.NewDeprecatedVersionInfo("v2", temporaliov1alpha1.VersionStatusDrained, true, true, true),
+									testhelpers.NewDeprecatedVersionInfo("v3", temporaliov1alpha1.VersionStatusDrained, true, true, true),
+								),
+						),
+				).
+				WithExistingDeployments(
+					testhelpers.NewDeploymentInfo("v0", 1),
+					testhelpers.NewDeploymentInfo("v1", 1),
+					testhelpers.NewDeploymentInfo("v2", 1),
+					testhelpers.NewDeploymentInfo("v3", 1),
+					testhelpers.NewDeploymentInfo("v4", 1),
+				).
+				WithWaitTime(5*time.Second).
+				WithExpectedStatus(
+					testhelpers.NewStatusBuilder(). // controller won't deploy v5, so it's not registered
+									WithTargetVersion("v5", temporaliov1alpha1.VersionStatusNotRegistered, -1, false, false).
+									WithCurrentVersion("v4", true, false).
+									WithDeprecatedVersions( // drained but has pollers, so ineligible for deletion
+							testhelpers.NewDeprecatedVersionInfo("v0", temporaliov1alpha1.VersionStatusDrained, true, false, true),
+							testhelpers.NewDeprecatedVersionInfo("v1", temporaliov1alpha1.VersionStatusDrained, true, false, true),
+							testhelpers.NewDeprecatedVersionInfo("v2", temporaliov1alpha1.VersionStatusDrained, true, false, true),
+							testhelpers.NewDeprecatedVersionInfo("v3", temporaliov1alpha1.VersionStatusDrained, true, false, true),
+						),
+				).
+				WithExpectedDeployments(
+					testhelpers.NewDeploymentInfo("v0", 1),
+					testhelpers.NewDeploymentInfo("v1", 1),
+					testhelpers.NewDeploymentInfo("v2", 1),
+					testhelpers.NewDeploymentInfo("v3", 1),
+					testhelpers.NewDeploymentInfo("v4", 1),
+					testhelpers.NewDeploymentInfo("v5", 1),
+				),
+		},
+		{
+			name: "progressive-rollout-blocked-by-manager-identity",
+			builder: testhelpers.NewTestCase().
+				WithInput(
+					testhelpers.NewTemporalWorkerDeploymentBuilder().
+						WithProgressiveStrategy(testhelpers.ProgressiveStep(5, time.Hour)).
+						WithTargetTemplate("v1").
+						WithStatus(
+							testhelpers.NewStatusBuilder().
+								WithTargetVersion("v0", temporaliov1alpha1.VersionStatusCurrent, -1, true, true).
+								WithCurrentVersion("v0", true, true),
+						),
+				).
+				WithExistingDeployments(
+					testhelpers.NewDeploymentInfo("v0", 1),
+				).
+				WithWaitTime(5 * time.Second).
+				WithSetupFunction(setManagerIdentityToOther).
+				WithExpectedStatus(
+					testhelpers.NewStatusBuilder().
+						WithTargetVersion("v1", temporaliov1alpha1.VersionStatusInactive, -1, true, false).
+						WithCurrentVersion("v0", true, false),
+				).
+				WithExpectedDeployments(
+					testhelpers.NewDeploymentInfo("v0", 1),
+				).
+				WithValidatorFunction(validateManagerIdentity("some-other-cli-user")),
+		},
+		{
+			name: "progressive-rollout-unblocked-after-manager-identity-cleared",
+			builder: testhelpers.NewTestCase().
+				WithInput(
+					testhelpers.NewTemporalWorkerDeploymentBuilder().
+						WithProgressiveStrategy(testhelpers.ProgressiveStep(5, time.Hour)).
+						WithTargetTemplate("v1").
+						WithStatus(
+							testhelpers.NewStatusBuilder().
+								WithTargetVersion("v0", temporaliov1alpha1.VersionStatusCurrent, -1, true, true).
+								WithCurrentVersion("v0", true, true),
+						),
+				).
+				WithExistingDeployments(
+					testhelpers.NewDeploymentInfo("v0", 1),
+				).
+				WithSetupFunction(setManagerIdentityBlockThenUnblock).
+				WithExpectedStatus(
+					testhelpers.NewStatusBuilder().
+						WithTargetVersion("v1", temporaliov1alpha1.VersionStatusRamping, 5, true, false).
+						WithCurrentVersion("v0", true, false),
+				).
+				WithExpectedDeployments(
+					testhelpers.NewDeploymentInfo("v0", 1),
+				),
+		},
+	}
+
+	for _, tc := range progressiveStrategyTestCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			testTemporalWorkerDeploymentCreation(ctx, t, k8sClient, mgr, ts, tc.builder.BuildWithValues(tc.name, testNamespace.Name, ts.GetDefaultNamespace()))
 		})
 	}
 
 	// Create short TTL test Temporal server and client
 	dcShortTTL := dynamicconfig.NewMemoryClient()
 	// make versions eligible for deletion faster
-	dcShortTTL.OverrideValue("matching.PollerHistoryTTL", testShortPollerHistoryTTL) // default is 5 minutes
+	dcShortTTL.OverrideValue(dynamicconfig.MakeKey("matching.PollerHistoryTTL"), testShortPollerHistoryTTL) // default is 5 minutes
 	// make versions drain faster
-	dcShortTTL.OverrideValue("matching.wv.VersionDrainageStatusVisibilityGracePeriod", testDrainageVisibilityGracePeriod)
-	dcShortTTL.OverrideValue("matching.wv.VersionDrainageStatusRefreshInterval", testDrainageRefreshInterval)
+	dcShortTTL.OverrideValue(dynamicconfig.MakeKey("matching.wv.VersionDrainageStatusVisibilityGracePeriod"), testDrainageVisibilityGracePeriod)
+	dcShortTTL.OverrideValue(dynamicconfig.MakeKey("matching.wv.VersionDrainageStatusRefreshInterval"), testDrainageRefreshInterval)
+	dcShortTTL.OverrideValue(dynamicconfig.MakeKey("matching.maxVersionsInDeployment"), testMaxVersionsInDeployment)
 	tsShortTTL := temporaltest.NewServer(
 		temporaltest.WithT(t),
 		temporaltest.WithBaseServerOptions(temporal.WithDynamicConfigClient(dcShortTTL)),
 	)
-	testsShortPollerTTL := map[string]*testhelpers.TestCaseBuilder{
+	testsShortPollerTTL := []testCase{
 		// Note: Add tests that require pollers to expire quickly here
-		"nth-rollout-unblocked-after-pollers-die": testhelpers.NewTestCase().
-			WithInput(
-				testhelpers.NewTemporalWorkerDeploymentBuilder().
-					WithAllAtOnceStrategy().
-					WithTargetTemplate("v5").
-					WithStatus(
-						testhelpers.NewStatusBuilder().
-							WithTargetVersion("v4", temporaliov1alpha1.VersionStatusCurrent, -1, true, true).
-							WithCurrentVersion("v4", true, true).
-							WithDeprecatedVersions( // drained AND has no pollers -> eligible for deletion
-								testhelpers.NewDeprecatedVersionInfo("v0", temporaliov1alpha1.VersionStatusDrained, true, true, true),
-								testhelpers.NewDeprecatedVersionInfo("v1", temporaliov1alpha1.VersionStatusDrained, true, true, true),
-								testhelpers.NewDeprecatedVersionInfo("v2", temporaliov1alpha1.VersionStatusDrained, true, true, true),
-								testhelpers.NewDeprecatedVersionInfo("v3", temporaliov1alpha1.VersionStatusDrained, true, true, true),
-							),
-					),
-			).
-			WithExistingDeployments(
-				testhelpers.NewDeploymentInfo("v0", 0), // 0 replicas -> no pollers
-				testhelpers.NewDeploymentInfo("v1", 1),
-				testhelpers.NewDeploymentInfo("v2", 1),
-				testhelpers.NewDeploymentInfo("v3", 1),
-				testhelpers.NewDeploymentInfo("v4", 1),
-			).
-			WithWaitTime(5*time.Second).
-			WithExpectedStatus(
-				testhelpers.NewStatusBuilder().
-					WithTargetVersion("v5", temporaliov1alpha1.VersionStatusCurrent, -1, false, false).
-					WithCurrentVersion("v5", true, false).
-					WithDeprecatedVersions( // drained AND has pollers -> eligible for deletion
-						testhelpers.NewDeprecatedVersionInfo("v0", temporaliov1alpha1.VersionStatusDrained, true, false, true),
-						testhelpers.NewDeprecatedVersionInfo("v1", temporaliov1alpha1.VersionStatusDrained, true, false, true),
-						testhelpers.NewDeprecatedVersionInfo("v2", temporaliov1alpha1.VersionStatusDrained, true, false, true),
-						testhelpers.NewDeprecatedVersionInfo("v3", temporaliov1alpha1.VersionStatusDrained, true, false, true),
-						testhelpers.NewDeprecatedVersionInfo("v4", temporaliov1alpha1.VersionStatusDrained, true, false, true),
-					),
-			).
-			WithExpectedDeployments(
-				testhelpers.NewDeploymentInfo("v0", 0), // 0 replicas -> no pollers
-				testhelpers.NewDeploymentInfo("v1", 1),
-				testhelpers.NewDeploymentInfo("v2", 1),
-				testhelpers.NewDeploymentInfo("v3", 1),
-				testhelpers.NewDeploymentInfo("v4", 1),
-				testhelpers.NewDeploymentInfo("v5", 1),
-			),
+		{
+			name: "6th-rollout-unblocked-after-pollers-die-max-ctrlr-versions",
+			builder: testhelpers.NewTestCase().
+				WithInput(
+					testhelpers.NewTemporalWorkerDeploymentBuilder().
+						WithAllAtOnceStrategy().
+						WithTargetTemplate("v5").
+						WithStatus(
+							testhelpers.NewStatusBuilder().
+								WithTargetVersion("v4", temporaliov1alpha1.VersionStatusCurrent, -1, true, true).
+								WithCurrentVersion("v4", true, true).
+								WithDeprecatedVersions( // drained AND has no pollers -> eligible for deletion
+									testhelpers.NewDeprecatedVersionInfo("v0", temporaliov1alpha1.VersionStatusDrained, true, true, true),
+									testhelpers.NewDeprecatedVersionInfo("v1", temporaliov1alpha1.VersionStatusDrained, true, true, true),
+									testhelpers.NewDeprecatedVersionInfo("v2", temporaliov1alpha1.VersionStatusDrained, true, true, true),
+									testhelpers.NewDeprecatedVersionInfo("v3", temporaliov1alpha1.VersionStatusDrained, true, true, true),
+								),
+						),
+				).
+				WithExistingDeployments(
+					testhelpers.NewDeploymentInfo("v0", 0), // 0 replicas -> no pollers
+					testhelpers.NewDeploymentInfo("v1", 1),
+					testhelpers.NewDeploymentInfo("v2", 1),
+					testhelpers.NewDeploymentInfo("v3", 1),
+					testhelpers.NewDeploymentInfo("v4", 1),
+				).
+				WithWaitTime(5*time.Second).
+				WithExpectedStatus(
+					testhelpers.NewStatusBuilder().
+						WithTargetVersion("v5", temporaliov1alpha1.VersionStatusCurrent, -1, false, false).
+						WithCurrentVersion("v5", true, false).
+						WithDeprecatedVersions( // drained AND has pollers -> eligible for deletion
+							testhelpers.NewDeprecatedVersionInfo("v0", temporaliov1alpha1.VersionStatusDrained, true, false, true),
+							testhelpers.NewDeprecatedVersionInfo("v1", temporaliov1alpha1.VersionStatusDrained, true, false, true),
+							testhelpers.NewDeprecatedVersionInfo("v2", temporaliov1alpha1.VersionStatusDrained, true, false, true),
+							testhelpers.NewDeprecatedVersionInfo("v3", temporaliov1alpha1.VersionStatusDrained, true, false, true),
+							testhelpers.NewDeprecatedVersionInfo("v4", temporaliov1alpha1.VersionStatusDrained, true, false, true),
+						),
+				).
+				WithExpectedDeployments(
+					testhelpers.NewDeploymentInfo("v0", 0), // 0 replicas -> no pollers
+					testhelpers.NewDeploymentInfo("v1", 1),
+					testhelpers.NewDeploymentInfo("v2", 1),
+					testhelpers.NewDeploymentInfo("v3", 1),
+					testhelpers.NewDeploymentInfo("v4", 1),
+					testhelpers.NewDeploymentInfo("v5", 1),
+				),
+		},
+		{
+			name: "7th-rollout-unblocked-after-pollers-die-version-deleted",
+			builder: testhelpers.NewTestCase().
+				WithInput(
+					testhelpers.NewTemporalWorkerDeploymentBuilder().
+						WithAllAtOnceStrategy().
+						WithTargetTemplate("v6").
+						WithStatus(
+							testhelpers.NewStatusBuilder().
+								WithTargetVersion("v5", temporaliov1alpha1.VersionStatusCurrent, -1, true, true).
+								WithCurrentVersion("v5", true, true).
+								WithDeprecatedVersions( // drained AND has no pollers -> eligible for deletion
+									testhelpers.NewDeprecatedVersionInfo("v0", temporaliov1alpha1.VersionStatusDrained, true, true, true),
+									testhelpers.NewDeprecatedVersionInfo("v1", temporaliov1alpha1.VersionStatusDrained, true, true, true),
+									testhelpers.NewDeprecatedVersionInfo("v2", temporaliov1alpha1.VersionStatusDrained, true, true, true),
+									testhelpers.NewDeprecatedVersionInfo("v3", temporaliov1alpha1.VersionStatusDrained, true, true, true),
+									testhelpers.NewDeprecatedVersionInfo("v4", temporaliov1alpha1.VersionStatusDrained, true, true, true),
+								),
+						),
+				).
+				WithExistingDeployments(
+					testhelpers.NewDeploymentInfo("v0", 0), // 0 replicas -> no pollers
+					testhelpers.NewDeploymentInfo("v1", 1),
+					testhelpers.NewDeploymentInfo("v2", 1),
+					testhelpers.NewDeploymentInfo("v3", 1),
+					testhelpers.NewDeploymentInfo("v4", 1),
+					testhelpers.NewDeploymentInfo("v5", 1),
+				).
+				WithWaitTime(5*time.Second).
+				WithExpectedStatus(
+					testhelpers.NewStatusBuilder().
+						WithTargetVersion("v6", temporaliov1alpha1.VersionStatusCurrent, -1, false, false).
+						WithCurrentVersion("v6", true, false).
+						WithDeprecatedVersions( // drained AND has pollers -> eligible for deletion
+							testhelpers.NewDeprecatedVersionInfo("v1", temporaliov1alpha1.VersionStatusDrained, true, false, true),
+							testhelpers.NewDeprecatedVersionInfo("v2", temporaliov1alpha1.VersionStatusDrained, true, false, true),
+							testhelpers.NewDeprecatedVersionInfo("v3", temporaliov1alpha1.VersionStatusDrained, true, false, true),
+							testhelpers.NewDeprecatedVersionInfo("v4", temporaliov1alpha1.VersionStatusDrained, true, false, true),
+							testhelpers.NewDeprecatedVersionInfo("v5", temporaliov1alpha1.VersionStatusDrained, true, false, true),
+						),
+				).
+				WithExpectedDeployments(
+					testhelpers.NewDeploymentInfo("v0", 0), // 0 replicas -> no pollers
+					testhelpers.NewDeploymentInfo("v1", 1),
+					testhelpers.NewDeploymentInfo("v2", 1),
+					testhelpers.NewDeploymentInfo("v3", 1),
+					testhelpers.NewDeploymentInfo("v4", 1),
+					testhelpers.NewDeploymentInfo("v5", 1),
+					testhelpers.NewDeploymentInfo("v6", 1),
+				),
+		},
 	}
 
-	for testName, tc := range testsShortPollerTTL {
-		t.Run(testName, func(t *testing.T) {
+	for _, tc := range testsShortPollerTTL {
+		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
-			testTemporalWorkerDeploymentCreation(ctx, t, k8sClient, mgr, tsShortTTL, tc.BuildWithValues(testName, testNamespace.Name, tsShortTTL.GetDefaultNamespace()))
+			testTemporalWorkerDeploymentCreation(ctx, t, k8sClient, mgr, tsShortTTL, tc.builder.BuildWithValues(tc.name, testNamespace.Name, tsShortTTL.GetDefaultNamespace()))
 		})
 	}
 
+	// WorkerResourceTemplate integration test:
+	// Creates a WRT with an HPA spec and verifies that the controller applies one HPA per active Build ID.
+	t.Run("wrt-creates-hpa-per-build-id", func(t *testing.T) {
+		ctx := context.Background()
+		twdName := "wrt-hpa-test"
+		wrtName := "test-hpa"
+
+		// Build the TWD using the existing builder (sets connection ref, temporal namespace, task queue).
+		tc := testhelpers.NewTestCase().
+			WithInput(
+				testhelpers.NewTemporalWorkerDeploymentBuilder().
+					WithAllAtOnceStrategy().
+					WithTargetTemplate("v1.0"),
+			).
+			WithExpectedStatus(
+				testhelpers.NewStatusBuilder().
+					WithTargetVersion("v1.0", temporaliov1alpha1.VersionStatusCurrent, -1, true, false).
+					WithCurrentVersion("v1.0", true, false),
+			).
+			BuildWithValues(twdName, testNamespace.Name, ts.GetDefaultNamespace())
+		twd := tc.GetTWD()
+
+		t.Log("Creating TemporalConnection")
+		temporalConnection := &temporaliov1alpha1.TemporalConnection{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      twd.Spec.WorkerOptions.TemporalConnectionRef.Name,
+				Namespace: twd.Namespace,
+			},
+			Spec: temporaliov1alpha1.TemporalConnectionSpec{
+				HostPort: ts.GetFrontendHostPort(),
+			},
+		}
+		if err := k8sClient.Create(ctx, temporalConnection); err != nil {
+			t.Fatalf("failed to create TemporalConnection: %v", err)
+		}
+
+		env := testhelpers.TestEnv{
+			K8sClient:                  k8sClient,
+			Mgr:                        mgr,
+			Ts:                         ts,
+			Connection:                 temporalConnection,
+			ExistingDeploymentReplicas: make(map[string]int32),
+			ExistingDeploymentImages:   make(map[string]string),
+			ExpectedDeploymentReplicas: make(map[string]int32),
+		}
+
+		t.Log("Creating TemporalWorkerDeployment")
+		if err := k8sClient.Create(ctx, twd); err != nil {
+			t.Fatalf("failed to create TemporalWorkerDeployment: %v", err)
+		}
+
+		// Wait for the controller to create the versioned Deployment, then start workers
+		// and mark it healthy so that the reconciler sees it as an active Build ID.
+		waitForExpectedTargetDeployment(t, twd, env, 30*time.Second)
+		buildID := k8s.ComputeBuildID(twd)
+		depName := k8s.ComputeVersionedDeploymentName(twd.Name, buildID)
+		stopFuncs := applyDeployment(t, ctx, k8sClient, depName, testNamespace.Name)
+		defer handleStopFuncs(stopFuncs)
+
+		// Wait for TWD status to reach Current before creating the WRT,
+		// so that k8sState.Deployments already contains the active Build ID
+		// when the reconciler next runs.
+		verifyTemporalWorkerDeploymentStatusEventually(t, ctx, env, twd.Name, twd.Namespace, tc.GetExpectedStatus(), 30*time.Second, 5*time.Second)
+
+		t.Log("Creating WorkerResourceTemplate with HPA spec")
+		wrt := &temporaliov1alpha1.WorkerResourceTemplate{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      wrtName,
+				Namespace: testNamespace.Name,
+			},
+			Spec: temporaliov1alpha1.WorkerResourceTemplateSpec{
+				TemporalWorkerDeploymentRef: temporaliov1alpha1.TemporalWorkerDeploymentReference{Name: twd.Name},
+				// scaleTargetRef is set to {} to trigger auto-injection by the controller.
+				Template: runtime.RawExtension{Raw: []byte(`{
+					"apiVersion": "autoscaling/v2",
+					"kind": "HorizontalPodAutoscaler",
+					"spec": {
+						"scaleTargetRef": {},
+						"minReplicas": 2,
+						"maxReplicas": 5,
+						"metrics": []
+					}
+				}`)},
+			},
+		}
+		if err := k8sClient.Create(ctx, wrt); err != nil {
+			t.Fatalf("failed to create WorkerResourceTemplate: %v", err)
+		}
+
+		// Compute expected HPA name using the same function the controller uses.
+		hpaName := k8s.ComputeWorkerResourceTemplateName(twd.Name, wrtName, buildID)
+		expectedDeploymentName := k8s.ComputeVersionedDeploymentName(twd.Name, buildID)
+
+		// Poll until the HPA appears and verify scaleTargetRef was auto-injected.
+		waitForOwnedHPAWithInjectedScaleTargetRef(t, ctx, k8sClient, testNamespace.Name, hpaName, expectedDeploymentName, 30*time.Second)
+
+		// Poll until WRT.Status.Versions shows a successful apply for the build ID.
+		waitForWRTStatusApplied(t, ctx, k8sClient, testNamespace.Name, wrtName, buildID, 30*time.Second)
+
+		// Assert that the WRT has the TWD as a controller owner reference.
+		assertWRTControllerOwnerRef(t, ctx, k8sClient, testNamespace.Name, wrtName, twd.Name)
+	})
+
+	// WRT integration tests: per-Build-ID HPA owner refs and scaleTargetRef injection,
+	// PDB matchLabels injection, multiple WRTs on the same TWD, template variable rendering,
+	// multi-version rollout copies, SSA apply failure handling, and SSA idempotency.
+	// Each entry uses the standard runner; WRT-specific assertions are in ValidatorFunction.
+	for _, tc := range wrtTestCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			testTemporalWorkerDeploymentCreation(ctx, t, k8sClient, mgr, ts, tc.builder.BuildWithValues(tc.name, testNamespace.Name, ts.GetDefaultNamespace()))
+		})
+	}
+
+	// Conditions and events tests
+	runConditionsAndEventsTests(t, k8sClient, mgr, ts, testNamespace.Name)
 }
 
 // testTemporalWorkerDeploymentCreation tests the creation of a TemporalWorkerDeployment and waits for the expected status
@@ -406,9 +997,20 @@ func testTemporalWorkerDeploymentCreation(
 		f(t, ctx, tc, env)
 	}
 
+	// Apply any test-specific mutations to the TWD before it is created.
+	if f := tc.GetTWDMutatorFunc(); f != nil {
+		f(twd)
+	}
+
 	t.Log("Creating a TemporalWorkerDeployment")
 	if err := k8sClient.Create(ctx, twd); err != nil {
 		t.Fatalf("failed to create TemporalWorkerDeployment: %v", err)
+	}
+
+	// Hook: runs after TWD creation but before waiting for the target Deployment.
+	// Use this to assert blocking behaviour and then unblock the rollout.
+	if f := tc.GetPostTWDCreateFunc(); f != nil {
+		f(t, ctx, tc, env)
 	}
 
 	t.Log("Waiting for the controller to reconcile")
@@ -416,7 +1018,7 @@ func testTemporalWorkerDeploymentCreation(
 
 	// only wait for and create the deployment if it is expected
 	if expectedStatus.TargetVersion.Status != temporaliov1alpha1.VersionStatusNotRegistered {
-		waitForDeployment(t, k8sClient, expectedDeploymentName, twd.Namespace, 30*time.Second)
+		waitForExpectedTargetDeployment(t, twd, env, 30*time.Second)
 		workerStopFuncs := applyDeployment(t, ctx, k8sClient, expectedDeploymentName, twd.Namespace)
 		defer handleStopFuncs(workerStopFuncs)
 	}

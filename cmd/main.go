@@ -91,16 +91,16 @@ func main() {
 			}))),
 			mgr.GetClient(),
 		),
+		Recorder: mgr.GetEventRecorderFor("temporal-worker-controller"),
 		MaxDeploymentVersionsIneligibleForDeletion: controller.GetControllerMaxDeploymentVersionsIneligibleForDeletion(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "TemporalWorkerDeployment")
 		os.Exit(1)
 	}
-	// TODO(jlegrone): Enable the webhook after fixing TLS
-	//if err = (&temporaliov1alpha1.TemporalWorker{}).SetupWebhookWithManager(mgr); err != nil {
-	//	setupLog.Error(err, "unable to create webhook", "webhook", "TemporalWorker")
-	//	os.Exit(1)
-	//}
+	if err = temporaliov1alpha1.NewWorkerResourceTemplateValidator(mgr).SetupWebhookWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create webhook", "webhook", "WorkerResourceTemplate")
+		os.Exit(1)
+	}
 	//+kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {

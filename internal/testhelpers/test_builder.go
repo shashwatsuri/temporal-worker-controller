@@ -80,6 +80,12 @@ func (b *TemporalWorkerDeploymentBuilder) WithTargetTemplate(imageName string) *
 	return b
 }
 
+// WithUnsafeCustomBuildID sets the optional custom build id of the TWD, thus defining a stable target version separate from the hash of the pod spec.
+func (b *TemporalWorkerDeploymentBuilder) WithUnsafeCustomBuildID(buildID string) *TemporalWorkerDeploymentBuilder {
+	b.twd.Spec.WorkerOptions.UnsafeCustomBuildID = buildID
+	return b
+}
+
 // WithTemporalConnection sets the temporal connection name
 func (b *TemporalWorkerDeploymentBuilder) WithTemporalConnection(connectionName string) *TemporalWorkerDeploymentBuilder {
 	b.twd.Spec.WorkerOptions.TemporalConnectionRef = temporaliov1alpha1.TemporalConnectionReference{Name: connectionName}
@@ -161,7 +167,7 @@ func (sb *StatusBuilder) WithNamespace(k8sNamespace string) *StatusBuilder {
 // WithCurrentVersion sets the current version in the status
 func (sb *StatusBuilder) WithCurrentVersion(imageName string, healthy, createDeployment bool) *StatusBuilder {
 	sb.currentVersionBuilder = func(twdName string, namespace string) *temporaliov1alpha1.CurrentWorkerDeploymentVersion {
-		return MakeCurrentVersion(namespace, twdName, imageName, healthy, createDeployment)
+		return MakeCurrentVersion(namespace, twdName, imageName, "", healthy, createDeployment)
 	}
 	return sb
 }
@@ -171,7 +177,18 @@ func (sb *StatusBuilder) WithCurrentVersion(imageName string, healthy, createDep
 // Target Version is required.
 func (sb *StatusBuilder) WithTargetVersion(imageName string, status temporaliov1alpha1.VersionStatus, rampPercentage int32, healthy bool, createDeployment bool) *StatusBuilder {
 	sb.targetVersionBuilder = func(twdName string, namespace string) temporaliov1alpha1.TargetWorkerDeploymentVersion {
-		return MakeTargetVersion(namespace, twdName, imageName, status, rampPercentage, healthy, createDeployment)
+		return MakeTargetVersion(namespace, twdName, imageName, "", status, rampPercentage, healthy, createDeployment)
+	}
+	return sb
+}
+
+// WithTargetVersionWithCustomBuild sets the target version in the status with a custom build id not based on the pod spec.
+// Set createDeployment to true if the test runner should create the Deployment, or false if you expect the controller to create it..
+// Target Version is required.
+func (sb *StatusBuilder) WithTargetVersionWithCustomBuild(imageName, unsafeCustomBuildID string, status temporaliov1alpha1.VersionStatus, rampPercentage int32, healthy bool, createDeployment bool) *StatusBuilder {
+	sb.targetVersionBuilder = func(twdName string, namespace string) temporaliov1alpha1.TargetWorkerDeploymentVersion {
+		tv := MakeTargetVersion(namespace, twdName, imageName, unsafeCustomBuildID, status, rampPercentage, healthy, createDeployment)
+		return tv
 	}
 	return sb
 }
@@ -184,7 +201,7 @@ func (sb *StatusBuilder) WithDeprecatedVersions(infos ...DeprecatedVersionInfo) 
 	sb.deprecatedVersionsBuilder = func(twdName string, namespace string) []*temporaliov1alpha1.DeprecatedWorkerDeploymentVersion {
 		ret := make([]*temporaliov1alpha1.DeprecatedWorkerDeploymentVersion, len(infos))
 		for i, info := range infos {
-			ret[i] = MakeDeprecatedVersion(namespace, twdName, info.image, info.status, info.healthy, info.createDeployment, info.hasDeployment)
+			ret[i] = MakeDeprecatedVersion(namespace, twdName, info.image, "", info.status, info.healthy, info.createDeployment, info.hasDeployment)
 
 		}
 		return ret
@@ -242,6 +259,17 @@ type TestCase struct {
 	// It can be used for additional state creation or destruction.
 	setupFunc func(t *testing.T, ctx context.Context, tc TestCase, env TestEnv)
 
+	// twdMutatorFunc is called on the TWD immediately before it is created in the API server.
+	// Use this for test-specific TWD modifications not expressible through the builder
+	// (e.g. setting a gate config with InputFrom.ConfigMapKeyRef).
+	twdMutatorFunc func(*temporaliov1alpha1.TemporalWorkerDeployment)
+
+	// postTWDCreateFunc is called immediately after the TWD is created but before the runner
+	// waits for the target Deployment. Use this to inject steps that must happen after TWD
+	// creation but before the rollout proceeds (e.g. asserting a blocked rollout, then
+	// creating the resource that unblocks it).
+	postTWDCreateFunc func(t *testing.T, ctx context.Context, tc TestCase, env TestEnv)
+
 	// validatorFunc is an arbitrary function called after the test validates the expected TWD Status has been achieved.
 	// It can be used for additional state validation.
 	validatorFunc func(t *testing.T, ctx context.Context, tc TestCase, env TestEnv)
@@ -275,6 +303,14 @@ func (tc *TestCase) GetSetupFunc() func(t *testing.T, ctx context.Context, tc Te
 	return tc.setupFunc
 }
 
+func (tc *TestCase) GetTWDMutatorFunc() func(*temporaliov1alpha1.TemporalWorkerDeployment) {
+	return tc.twdMutatorFunc
+}
+
+func (tc *TestCase) GetPostTWDCreateFunc() func(t *testing.T, ctx context.Context, tc TestCase, env TestEnv) {
+	return tc.postTWDCreateFunc
+}
+
 func (tc *TestCase) GetValidatorFunc() func(t *testing.T, ctx context.Context, tc TestCase, env TestEnv) {
 	return tc.validatorFunc
 }
@@ -291,8 +327,10 @@ type TestCaseBuilder struct {
 	expectedDeploymentInfos []DeploymentInfo
 	waitTime                *time.Duration
 
-	setupFunc     func(t *testing.T, ctx context.Context, tc TestCase, env TestEnv)
-	validatorFunc func(t *testing.T, ctx context.Context, tc TestCase, env TestEnv)
+	setupFunc         func(t *testing.T, ctx context.Context, tc TestCase, env TestEnv)
+	twdMutatorFunc    func(*temporaliov1alpha1.TemporalWorkerDeployment)
+	postTWDCreateFunc func(t *testing.T, ctx context.Context, tc TestCase, env TestEnv)
+	validatorFunc     func(t *testing.T, ctx context.Context, tc TestCase, env TestEnv)
 }
 
 // NewTestCase creates a new test case builder
@@ -325,10 +363,30 @@ func (tcb *TestCaseBuilder) WithSetupFunction(f func(t *testing.T, ctx context.C
 	return tcb
 }
 
-// WithValidatorFunction defines a function that the test case will call after the TWD expected state has been validated.
-// Can be used to validate any other arbitrary state.
+// WithValidatorFunction defines a function called by the runner after both
+// verifyTemporalWorkerDeploymentStatusEventually and verifyTemporalStateMatchesStatusEventually
+// have confirmed the TWD has reached its expected state. Use it for additional assertions beyond
+// the standard TWD status and Temporal state checks — for example WRT-specific resource
+// inspection or multi-phase rollout scenarios that require further TWD updates.
 func (tcb *TestCaseBuilder) WithValidatorFunction(f func(t *testing.T, ctx context.Context, tc TestCase, env TestEnv)) *TestCaseBuilder {
 	tcb.validatorFunc = f
+	return tcb
+}
+
+// WithTWDMutatorFunc defines a function called on the TWD immediately before it is created.
+// Use this for test-specific modifications that are not expressible through the builder
+// (e.g. setting a gate config with InputFrom.ConfigMapKeyRef).
+func (tcb *TestCaseBuilder) WithTWDMutatorFunc(f func(*temporaliov1alpha1.TemporalWorkerDeployment)) *TestCaseBuilder {
+	tcb.twdMutatorFunc = f
+	return tcb
+}
+
+// WithPostTWDCreateFunc defines a function called immediately after the TWD is created but before
+// the runner waits for the target Deployment. Use this to inject steps that must happen after
+// TWD creation but before the rollout proceeds (e.g. asserting a blocked rollout, then creating
+// the resource that unblocks it).
+func (tcb *TestCaseBuilder) WithPostTWDCreateFunc(f func(t *testing.T, ctx context.Context, tc TestCase, env TestEnv)) *TestCaseBuilder {
+	tcb.postTWDCreateFunc = f
 	return tcb
 }
 
@@ -368,14 +426,23 @@ func NewDeprecatedVersionInfo(imageName string, status temporaliov1alpha1.Versio
 // DeploymentInfo defines the necessary information about a Deployment, so that tests can
 // recreate and validate state that is not visible in the TemporalWorkerDeployment status
 type DeploymentInfo struct {
-	image    string
-	replicas int32
+	image               string
+	replicas            int32
+	unsafeCustomBuildID string
 }
 
 func NewDeploymentInfo(imageName string, replicas int32) DeploymentInfo {
 	return DeploymentInfo{
 		image:    imageName,
 		replicas: replicas,
+	}
+}
+
+func NewDeploymentInfoWithUnsafeCustomBuildID(imageName, unsafeCustomBuildID string, replicas int32) DeploymentInfo {
+	return DeploymentInfo{
+		image:               imageName,
+		replicas:            replicas,
+		unsafeCustomBuildID: unsafeCustomBuildID,
 	}
 }
 
@@ -400,9 +467,11 @@ func (tcb *TestCaseBuilder) WithExpectedStatus(statusBuilder *StatusBuilder) *Te
 // Build returns the constructed test case
 func (tcb *TestCaseBuilder) Build() TestCase {
 	ret := TestCase{
-		setupFunc:     tcb.setupFunc,
-		validatorFunc: tcb.validatorFunc,
-		waitTime:      tcb.waitTime,
+		setupFunc:         tcb.setupFunc,
+		twdMutatorFunc:    tcb.twdMutatorFunc,
+		postTWDCreateFunc: tcb.postTWDCreateFunc,
+		validatorFunc:     tcb.validatorFunc,
+		waitTime:          tcb.waitTime,
 		twd: tcb.twdBuilder.
 			WithName(tcb.name).
 			WithNamespace(tcb.k8sNamespace).
@@ -418,12 +487,12 @@ func (tcb *TestCaseBuilder) Build() TestCase {
 		expectedDeploymentReplicas: make(map[string]int32),
 	}
 	for _, info := range tcb.existingDeploymentInfos {
-		buildId := MakeBuildId(tcb.name, info.image, nil)
+		buildId := MakeBuildID(tcb.name, info.image, info.unsafeCustomBuildID, nil)
 		ret.existingDeploymentReplicas[buildId] = info.replicas
 		ret.existingDeploymentImages[buildId] = info.image
 	}
 	for _, info := range tcb.expectedDeploymentInfos {
-		buildId := MakeBuildId(tcb.name, info.image, nil)
+		buildId := MakeBuildID(tcb.name, info.image, info.unsafeCustomBuildID, nil)
 		ret.expectedDeploymentReplicas[buildId] = info.replicas
 	}
 	ret.twd.Spec.Template = SetTaskQueue(ret.twd.Spec.Template, tcb.name)

@@ -5,6 +5,9 @@ on:
     branches: [ main ]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   skaffold-build:
     name: Test Skaffold Build
@@ -31,16 +34,25 @@ jobs:
     - name: Build worker-controller image
       run: |
         skaffold build --profile worker-controller --push=false
+      env:
+        DOCKER_BUILDKIT: 1
+        BUILDKIT_PROGRESS: plain
 
     - name: Build helloworld worker image
       run: |
         skaffold build --profile helloworld-worker --push=false
+      env:
+        DOCKER_BUILDKIT: 1
+        BUILDKIT_PROGRESS: plain
 
     # Verify that the demo worker patch applies successfully and builds.
     - name: Build helloworld worker image patch
       run: |
         git apply internal/demo/helloworld/changes/no-version-gate.patch
         skaffold build --profile helloworld-worker --push=false
+      env:
+        DOCKER_BUILDKIT: 1
+        BUILDKIT_PROGRESS: plain
 
   test-integration:
     name: Run Integration Tests
@@ -113,7 +125,13 @@ jobs:
         
     - name: Download dependencies
       run: go mod download
-      
+
+    - name: Install Helm
+      uses: azure/setup-helm@v3
+
+    - name: Build Helm chart dependencies
+      run: helm repo add jetstack https://charts.jetstack.io && helm dependency build helm/temporal-worker-controller
+
     - name: Run unit tests
       run: make test-unit
       

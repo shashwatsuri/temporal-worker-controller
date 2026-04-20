@@ -2,11 +2,14 @@
 
 bin
 dist
+helm/**/charts/*.tgz
 
 secret.env
 skaffold.env
 certs
 
 .DS_Store
+cover.out
 
 .claude
+config

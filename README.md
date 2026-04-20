@@ -4,8 +4,6 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/temporalio/temporal-worker-controller)](https://goreportcard.com/report/github.com/temporalio/temporal-worker-controller)
 
 > 🚀 **Public Preview**: This project is in [Public Preview](https://docs.temporal.io/evaluate/development-production-features/release-stages) and ready for production use cases*. Core functionality is complete with stable APIs.
-> 
-> *Dynamic auto-scaling based on workflow load is not yet implemented. Use cases must work with fixed worker replica counts.
 
 **The Temporal Worker Controller makes it simple and safe to deploy Temporal workers on Kubernetes.**
 
@@ -20,7 +18,8 @@ Temporal's [Worker Versioning](https://docs.temporal.io/production-deployment/wo
 📦 **Automatic version management** - Registers versions with Temporal, manages routing rules, and tracks version lifecycle  
 🎯 **Smart traffic routing** - New workflows automatically get routed to your target worker version  
 🛡️ **Progressive rollouts** - Catch incompatible changes early with small traffic percentages before they spread  
-⚡ **Easy rollbacks** - Instantly route traffic back to a previous version if issues are detected  
+⚡ **Easy rollbacks** - Instantly route traffic back to a previous version if issues are detected
+📈 **Per-version autoscaling** - Attach HPAs or other custom scalers to each versioned Deployment via [`WorkerResourceTemplate`](docs/worker-resource-templates.md)
 
 ## Quick Example
 
@@ -74,22 +73,38 @@ When you update the image, the controller automatically:
 
 ### Prerequisites
 
-- Kubernetes cluster (1.19+) 
-- [Temporal Server](https://docs.temporal.io/) (Cloud or self-hosted [v1.28.1](https://github.com/temporalio/temporal/releases/tag/v1.28.1))
+- Kubernetes cluster (1.19+)
+- Helm [v3.0+](https://github.com/helm/helm/releases) if deploying via our Helm chart
+- [Temporal Server](https://docs.temporal.io/) (Cloud or self-hosted [v1.29.1](https://github.com/temporalio/temporal/releases/tag/v1.29.1))
 - Basic familiarity with Temporal [Workers](https://docs.temporal.io/workers), [Workflows](https://docs.temporal.io/workflows), and [Worker Versioning](https://docs.temporal.io/production-deployment/worker-deployments/worker-versioning)
+- **TLS for the validating webhook** *(required for `WorkerResourceTemplate`)* — the recommended path is [cert-manager](https://cert-manager.io/docs/installation/), which handles certificate provisioning automatically. Install it separately or as a subchart of the controller chart (`certmanager.install: true`). If you prefer to manage TLS yourself, see [Webhook TLS](docs/worker-resource-templates.md#webhook-tls).
 
 ### 🔧 Installation
 
+CRDs are shipped as a separate Helm chart so they can be upgraded independently of the controller. Install the CRDs chart first, then the controller chart:
+
 ```bash
-# Install using Helm in your preferred namespace
+# 1. Install CRDs
+helm install temporal-worker-controller-crds \
+  oci://docker.io/temporalio/temporal-worker-controller-crds \
+  --version <version> \
+  --namespace <your-namespace> \
+  --create-namespace
+
+# 2. Install the controller
 helm install temporal-worker-controller \
   oci://docker.io/temporalio/temporal-worker-controller \
+  --version <version> \
   --namespace <your-namespace>
 ```
 
+See [docs/crd-management.md](docs/crd-management.md) for upgrade, rollback, and migration instructions.
+
 ### Next Steps
 
-**New to deploying workers with this controller?** → Start with our [Migration Guide](docs/migration-guide.md) to learn how to safely transition from traditional deployments.
+**New to deploying workers with this controller?** → Start with our [Migration Guide](docs/migration-to-versioned.md) to learn how to safely transition from traditional deployments.
+
+**Setting up CI/CD for steady-state rollouts?** → See the [CD Rollouts Guide](docs/cd-rollouts.md) for Helm, kubectl, ArgoCD, and Flux integration patterns.
 
 **Ready to dive deeper?** → Check out the [Architecture Guide](docs/architecture.md) to understand how the controller works, or the [Temporal Worker Versioning docs](https://docs.temporal.io/production-deployment/worker-deployments/worker-versioning) to learn about the underlying Temporal feature.
 
@@ -103,7 +118,7 @@ helm install temporal-worker-controller \
 - ✅ **Deletion of resources** associated with drained Worker Deployment Versions
 - ✅ **Multiple rollout strategies**: `Manual`, `AllAtOnce`, and `Progressive` rollouts
 - ✅ **Gate workflows** - Test new versions with a [pre-deployment test](https://docs.temporal.io/production-deployment/worker-deployments/worker-versioning#adding-a-pre-deployment-test) before routing real traffic to them
-- ⏳ **Load-based auto-scaling** - Not yet implemented (use fixed replica counts)
+- ✅ **Per-version attached resources** - Attach HPAs, PodDisruptionBudgets, or any namespaced Kubernetes resource to each worker version with running workers via [`WorkerResourceTemplate`](docs/worker-resource-templates.md) — this is also the recommended path for metric-based and backlog-based autoscaling
 
 
 ## 💡 Why Use This?
@@ -128,13 +143,17 @@ The Temporal Worker Controller eliminates this operational overhead by automatin
 
 ## 📖 Documentation
 
-| Document | Description |
-|----------|-------------|
-| [Migration Guide](docs/migration-guide.md) | Step-by-step guide for migrating from traditional deployments |
-| [Architecture](docs/architecture.md) | Technical deep-dive into how the controller works |
-| [Configuration](docs/configuration.md) | Complete configuration reference |
-| [Concepts](docs/concepts.md) | Key concepts and terminology |
-| [Limits](docs/limits.md) | Technical constraints and limitations |
+| Document                                                    | Description                                                           |
+|-------------------------------------------------------------|-----------------------------------------------------------------------|
+| [Migration Guide](docs/migration-to-versioned.md)           | Step-by-step guide for migrating from traditional deployments         |
+| [Reversion Guide](docs/migration-to-unversioned.md)         | Step-by-step guide for migrating back to unversioned deployment       |
+| [CD Rollouts](docs/cd-rollouts.md)                          | Helm, kubectl, ArgoCD, and Flux integration for steady-state rollouts |
+| [Architecture](docs/architecture.md)                        | Technical deep-dive into how the controller works                     |
+| [Configuration](docs/configuration.md)                      | Complete configuration reference                                      |
+| [Concepts](docs/concepts.md)                                | Key concepts and terminology                                          |
+| [Limits](docs/limits.md)                                    | Technical constraints and limitations                                 |
+| [WorkerResourceTemplate](docs/worker-resource-templates.md) | Attach HPAs, PDBs, and other resources to each versioned Deployment   |
+| [CRD Management](docs/crd-management.md)                    | CRD upgrade, rollback, and migration guide                            |
 
 ## 🔧 Worker Configuration
 
@@ -161,6 +180,8 @@ We welcome all contributions! This includes:
 ## 🛠️ Development
 
 Want to try the controller locally? Check out the [local demo guide](internal/demo/README.md) for development setup.
+
+Need a test controller image from an unmerged branch? Run the `publish-branch-image` GitHub Actions workflow with the branch name.
 
 ## 📄 License
 

@@ -15,6 +15,8 @@ import (
 	"github.com/temporalio/temporal-worker-controller/internal/temporal"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // plan holds the actions to execute during reconciliation
@@ -34,17 +36,27 @@ type plan struct {
 	// Start a workflow
 	startTestWorkflows []startWorkflowConfig
 
-	// Build IDs of versions from which the controller should
-	// remove IgnoreLastModifierKey from the version metadata
-	RemoveIgnoreLastModifierBuilds []string
+	// WorkerResourceTemplates to apply via Server-Side Apply, one per (WRT × Build ID) pair.
+	ApplyWorkerResources []planner.WorkerResourceApply
+
+	// Rendered WRT resource copies to delete explicitly on version sunset.
+	// Rendered resources are owned by the WRT (not the Deployment), so they are not
+	// GC'd when the Deployment is deleted; the controller deletes them here instead.
+	DeleteWorkerResources []planner.WorkerResourceRef
+
+	// WRTs that need a controller owner reference added, as (base, patched) pairs
+	// ready for client.MergeFrom patching in executePlan.
+	EnsureWRTOwnerRefs []planner.WRTOwnerRefPatch
 }
 
 // startWorkflowConfig defines a workflow to be started
 type startWorkflowConfig struct {
-	workflowType string
-	workflowID   string
-	buildID      string
-	taskQueue    string
+	workflowType  string
+	workflowID    string
+	buildID       string
+	taskQueue     string
+	input         []byte
+	isInputSecret bool // indicates if input should be treated as sensitive
 }
 
 // generatePlan creates a plan for the controller to execute
@@ -77,18 +89,54 @@ func (r *TemporalWorkerDeploymentReconciler) generatePlan(
 		ScaleDeployments:     make(map[*corev1.ObjectReference]uint32),
 	}
 
-	// Check if we need to force manual strategy due to external modification
 	rolloutStrategy := w.Spec.RolloutStrategy
-	if w.Status.LastModifierIdentity != getControllerIdentity() &&
-		w.Status.LastModifierIdentity != "" &&
-		!temporalState.IgnoreLastModifier {
-		l.Info(fmt.Sprintf("Forcing Manual rollout strategy since Worker Deployment was modified by a user with a different identity '%s'; to allow controller to make changes again, set 'temporal.io/ignore-last-modifier=true' in the metadata of your Current or Ramping Version; see ownership runbook at docs/ownership.md for more details.", w.Status.LastModifierIdentity))
-		rolloutStrategy.Strategy = temporaliov1alpha1.UpdateManual
+
+	// Resolve gate input if gate is configured
+	var gateInput []byte
+	var isGateInputSecret bool
+	if rolloutStrategy.Gate != nil {
+		// Fetch ConfigMap or Secret data if needed
+		var configMapData map[string]string
+		var configMapBinaryData map[string][]byte
+		var secretData map[string][]byte
+
+		if rolloutStrategy.Gate.InputFrom != nil {
+			if cmRef := rolloutStrategy.Gate.InputFrom.ConfigMapKeyRef; cmRef != nil {
+				cm := &corev1.ConfigMap{}
+				if err := r.Client.Get(ctx, types.NamespacedName{Namespace: w.Namespace, Name: cmRef.Name}, cm); err != nil {
+					return nil, fmt.Errorf("failed to get ConfigMap %s/%s: %w", w.Namespace, cmRef.Name, err)
+				}
+				configMapData = cm.Data
+				configMapBinaryData = cm.BinaryData
+			}
+			if secRef := rolloutStrategy.Gate.InputFrom.SecretKeyRef; secRef != nil {
+				sec := &corev1.Secret{}
+				if err := r.Client.Get(ctx, types.NamespacedName{Namespace: w.Namespace, Name: secRef.Name}, sec); err != nil {
+					return nil, fmt.Errorf("failed to get Secret %s/%s: %w", w.Namespace, secRef.Name, err)
+				}
+				secretData = sec.Data
+			}
+		}
+
+		gateInput, isGateInputSecret, err = planner.ResolveGateInput(rolloutStrategy.Gate, w.Namespace, configMapData, configMapBinaryData, secretData)
+		if err != nil {
+			return nil, fmt.Errorf("unable to resolve gate input: %w", err)
+		}
 	}
 
 	// Generate the plan using the planner package
 	plannerConfig := &planner.Config{
 		RolloutStrategy: rolloutStrategy,
+	}
+
+	// Fetch all WorkerResourceTemplates that reference this TWD so that the planner
+	// can render one apply action per (WRT × active Build ID) pair.
+	var wrtList temporaliov1alpha1.WorkerResourceTemplateList
+	if err := r.List(ctx, &wrtList,
+		client.InNamespace(w.Namespace),
+		client.MatchingFields{wrtWorkerRefKey: w.Name},
+	); err != nil {
+		return nil, fmt.Errorf("unable to list WorkerResourceTemplates: %w", err)
 	}
 
 	planResult, err := planner.GeneratePlan(
@@ -101,6 +149,11 @@ func (r *TemporalWorkerDeploymentReconciler) generatePlan(
 		plannerConfig,
 		workerDeploymentName,
 		r.MaxDeploymentVersionsIneligibleForDeletion,
+		gateInput,
+		isGateInputSecret,
+		wrtList.Items,
+		w.Name,
+		w.UID,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("error generating plan: %w", err)
@@ -114,15 +167,19 @@ func (r *TemporalWorkerDeploymentReconciler) generatePlan(
 	// Convert version config
 	plan.UpdateVersionConfig = planResult.VersionConfig
 
-	plan.RemoveIgnoreLastModifierBuilds = planResult.RemoveIgnoreLastModifierBuilds
+	plan.ApplyWorkerResources = planResult.ApplyWorkerResources
+	plan.DeleteWorkerResources = planResult.DeleteWorkerResources
+	plan.EnsureWRTOwnerRefs = planResult.EnsureWRTOwnerRefs
 
 	// Convert test workflows
 	for _, wf := range planResult.TestWorkflows {
 		plan.startTestWorkflows = append(plan.startTestWorkflows, startWorkflowConfig{
-			workflowType: wf.WorkflowType,
-			workflowID:   wf.WorkflowID,
-			buildID:      wf.BuildID,
-			taskQueue:    wf.TaskQueue,
+			workflowType:  wf.WorkflowType,
+			workflowID:    wf.WorkflowID,
+			buildID:       wf.BuildID,
+			taskQueue:     wf.TaskQueue,
+			input:         []byte(wf.GateInput),
+			isInputSecret: wf.IsInputSecret,
 		})
 	}
 

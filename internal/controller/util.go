@@ -11,6 +11,25 @@ import (
 	"github.com/temporalio/temporal-worker-controller/internal/defaults"
 )
 
+// Event reason constants for TemporalWorkerDeployment.
+//
+// These strings appear in Kubernetes Event objects (kubectl get events) and are
+// internal to the controller's implementation. They are not part of the CRD
+// status API and may change between releases. Do not write alerting or automation
+// that depends on these strings.
+const (
+	ReasonPlanGenerationFailed       = "PlanGenerationFailed"
+	ReasonPlanExecutionFailed        = "PlanExecutionFailed"
+	ReasonDeploymentCreateFailed     = "DeploymentCreateFailed"
+	ReasonDeploymentDeleteFailed     = "DeploymentDeleteFailed"
+	ReasonDeploymentScaleFailed      = "DeploymentScaleFailed"
+	ReasonDeploymentUpdateFailed     = "DeploymentUpdateFailed"
+	ReasonTestWorkflowStartFailed    = "TestWorkflowStartFailed"
+	ReasonVersionPromotionFailed     = "VersionPromotionFailed"
+	ReasonMetadataUpdateFailed       = "MetadataUpdateFailed"
+	ReasonManagerIdentityClaimFailed = "ManagerIdentityClaimFailed"
+)
+
 const (
 	controllerIdentityMetadataKey = "temporal.io/controller"
 	controllerVersionMetadataKey  = "temporal.io/controller-version"
@@ -18,6 +37,8 @@ const (
 	controllerVersionEnvKey                                    = "CONTROLLER_VERSION"
 	controllerIdentityEnvKey                                   = "CONTROLLER_IDENTITY"
 	ControllerMaxDeploymentVersionsIneligibleForDeletionEnvKey = "CONTROLLER_MAX_DEPLOYMENT_VERSIONS_INELIGIBLE_FOR_DELETION"
+
+	serverDeleteVersionIdentity = "try-delete-for-add-version"
 )
 
 // Version is set by goreleaser via ldflags at build time

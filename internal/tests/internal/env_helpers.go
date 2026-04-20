@@ -2,6 +2,7 @@ package internal
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -16,13 +17,11 @@ import (
 	"github.com/temporalio/temporal-worker-controller/internal/controller"
 	"github.com/temporalio/temporal-worker-controller/internal/controller/clientpool"
 	"github.com/temporalio/temporal-worker-controller/internal/k8s"
-	"github.com/temporalio/temporal-worker-controller/internal/temporal"
 	"github.com/temporalio/temporal-worker-controller/internal/testhelpers"
 	"go.temporal.io/api/taskqueue/v1"
 	"go.temporal.io/api/workflowservice/v1"
 	temporalClient "go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/log"
-	"go.temporal.io/sdk/worker"
 	"go.temporal.io/sdk/workflow"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -41,6 +40,7 @@ const (
 	testDrainageVisibilityGracePeriod    = time.Second
 	testDrainageRefreshInterval          = time.Second
 	testMaxVersionsIneligibleForDeletion = 5
+	testMaxVersionsInDeployment          = 6
 )
 
 // setupKubebuilderAssets sets up the KUBEBUILDER_ASSETS environment variable if not already set
@@ -52,7 +52,7 @@ func setupKubebuilderAssets() error {
 	// Get the repository root to find the setup-envtest binary
 	_, currentFile, _, ok := runtime.Caller(0)
 	if !ok {
-		return fmt.Errorf("failed to get current file path")
+		return errors.New("failed to get current file path")
 	}
 	repoRoot, err := filepath.Abs(filepath.Join(filepath.Dir(currentFile), "../../.."))
 	if err != nil {
@@ -113,7 +113,7 @@ func setupTestEnvironment(t *testing.T) (*rest.Config, client.Client, manager.Ma
 	t.Log("bootstrapping test environment")
 	testEnv := &envtest.Environment{
 		CRDDirectoryPaths: []string{
-			filepath.Join(getRepoRoot(t), "helm", "temporal-worker-controller", "templates", "crds"),
+			filepath.Join(getRepoRoot(t), "helm", "temporal-worker-controller-crds", "templates"),
 		},
 		ErrorIfCRDPathMissing: true,
 	}
@@ -153,6 +153,7 @@ func setupTestEnvironment(t *testing.T) (*rest.Config, client.Client, manager.Ma
 		Client:              mgr.GetClient(),
 		Scheme:              mgr.GetScheme(),
 		TemporalClientPool:  clientPool,
+		Recorder:            mgr.GetEventRecorderFor("temporal-worker-controller"),
 		DisableRecoverPanic: true,
 		MaxDeploymentVersionsIneligibleForDeletion: controller.GetControllerMaxDeploymentVersionsIneligibleForDeletion(),
 	}
@@ -163,7 +164,9 @@ func setupTestEnvironment(t *testing.T) (*rest.Config, client.Client, manager.Ma
 
 	// Start manager
 	ctx, cancel := context.WithCancel(context.Background())
+	managerStopped := make(chan struct{})
 	go func() {
+		defer close(managerStopped)
 		if err := mgr.Start(ctx); err != nil {
 			t.Errorf("failed to start manager: %v", err)
 		}
@@ -172,6 +175,7 @@ func setupTestEnvironment(t *testing.T) (*rest.Config, client.Client, manager.Ma
 	// Return cleanup function
 	cleanup := func() {
 		cancel()
+		<-managerStopped
 		if err := testEnv.Stop(); err != nil {
 			t.Errorf("failed to stop test environment: %v", err)
 		}
@@ -235,10 +239,10 @@ func setupUnversionedPollers(t *testing.T, ctx context.Context, tc testhelpers.T
 			return fmt.Errorf("error checking unversioned Activity pollers %v", err)
 		}
 		if !unversionedWorkflowPoller {
-			return fmt.Errorf("no workflow poller")
+			return errors.New("no workflow poller")
 		}
 		if !unversionedActivityPoller {
-			return fmt.Errorf("no activity poller")
+			return errors.New("no activity poller")
 		}
 		return nil
 	})
@@ -281,63 +285,68 @@ func getPollers(ctx context.Context,
 	return resp.GetPollers(), nil
 }
 
-func setUnversionedCurrent(t *testing.T, ctx context.Context, tc testhelpers.TestCase, env testhelpers.TestEnv) {
+// setManagerIdentityToOther sets the Worker Deployment's ManagerIdentity to "some-other-cli-user"
+// using a client with that identity. After this call, the controller (which has a different identity)
+// will be blocked from making routing changes to this deployment.
+func setManagerIdentityToOther(t *testing.T, ctx context.Context, tc testhelpers.TestCase, env testhelpers.TestEnv) {
 	workerDeploymentName := k8s.ComputeWorkerDeploymentName(tc.GetTWD())
-	deploymentHandle := env.Ts.GetDefaultClient().WorkerDeploymentClient().GetHandle(workerDeploymentName)
-
-	_, err := deploymentHandle.SetCurrentVersion(ctx, temporalClient.WorkerDeploymentSetCurrentVersionOptions{
-		BuildID:                 "",
-		IgnoreMissingTaskQueues: true,
+	c, err := temporalClient.Dial(temporalClient.Options{
+		HostPort:  env.Ts.GetFrontendHostPort(),
+		Namespace: env.Ts.GetDefaultNamespace(),
+		Identity:  "some-other-cli-user",
 	})
 	if err != nil {
-		t.Errorf("error setting unversioned current version to spook controller into manual mode: %v", err)
+		t.Fatalf("failed to create temporal client with other identity: %v", err)
 	}
-	t.Logf("set current version to unversioned with non-controller identity")
+	defer c.Close()
 
+	deploymentHandle := c.WorkerDeploymentClient().GetHandle(workerDeploymentName)
+	_, err = deploymentHandle.SetManagerIdentity(ctx, temporalClient.WorkerDeploymentSetManagerIdentityOptions{
+		Self: true,
+	})
+	if err != nil {
+		t.Errorf("error setting manager identity to other: %v", err)
+	}
+	t.Logf("set manager identity to 'some-other-cli-user'")
 }
 
-func setCurrentAndSetIgnoreModifierMetadata(t *testing.T, ctx context.Context, tc testhelpers.TestCase, env testhelpers.TestEnv) {
+// setManagerIdentityBlockThenUnblock sets the Worker Deployment's ManagerIdentity to "some-other-cli-user"
+// and then immediately clears it. This simulates a transient block: by the time the controller reconciles,
+// the ManagerIdentity is empty and the controller can claim it normally.
+func setManagerIdentityBlockThenUnblock(t *testing.T, ctx context.Context, tc testhelpers.TestCase, env testhelpers.TestEnv) {
 	workerDeploymentName := k8s.ComputeWorkerDeploymentName(tc.GetTWD())
-	deploymentHandle := env.Ts.GetDefaultClient().WorkerDeploymentClient().GetHandle(workerDeploymentName)
-
-	// change current version arbitrarily so we can be the last modifier
-	resp, err := deploymentHandle.SetCurrentVersion(ctx, temporalClient.WorkerDeploymentSetCurrentVersionOptions{
-		BuildID:                 "",
-		IgnoreMissingTaskQueues: true,
+	c, err := temporalClient.Dial(temporalClient.Options{
+		HostPort:  env.Ts.GetFrontendHostPort(),
+		Namespace: env.Ts.GetDefaultNamespace(),
+		Identity:  "some-other-cli-user",
 	})
 	if err != nil {
-		t.Errorf("error setting unversioned current version to spook controller into manual mode: %v", err)
+		t.Fatalf("failed to create temporal client with other identity: %v", err)
 	}
-	t.Logf("set current version to unversioned with non-controller identity")
+	defer c.Close()
 
-	// set it back to what it was so that it's non-nil
-	_, err = deploymentHandle.SetCurrentVersion(ctx, temporalClient.WorkerDeploymentSetCurrentVersionOptions{
-		BuildID: resp.PreviousVersion.BuildId,
+	deploymentHandle := c.WorkerDeploymentClient().GetHandle(workerDeploymentName)
+	resp, err := deploymentHandle.SetManagerIdentity(ctx, temporalClient.WorkerDeploymentSetManagerIdentityOptions{
+		Self: true,
 	})
 	if err != nil {
-		t.Errorf("error restoring current version: %v", err)
+		t.Errorf("error setting manager identity to other: %v", err)
+		return
 	}
-	t.Logf("set current version to build %v with non-controller identity", resp.PreviousVersion.BuildId)
+	t.Logf("set manager identity to 'some-other-cli-user'")
 
-	// set the IgnoreLastModifier metadata
-	_, err = deploymentHandle.UpdateVersionMetadata(ctx, temporalClient.WorkerDeploymentUpdateVersionMetadataOptions{
-		Version: worker.WorkerDeploymentVersion{
-			DeploymentName: workerDeploymentName,
-			BuildId:        resp.PreviousVersion.BuildId,
-		},
-		MetadataUpdate: temporalClient.WorkerDeploymentMetadataUpdate{
-			UpsertEntries: map[string]interface{}{
-				temporal.IgnoreLastModifierKey: "true",
-			},
-		},
+	_, err = deploymentHandle.SetManagerIdentity(ctx, temporalClient.WorkerDeploymentSetManagerIdentityOptions{
+		ManagerIdentity: "", // clear
+		ConflictToken:   resp.ConflictToken,
 	})
 	if err != nil {
-		t.Errorf("error updating version metadata: %v", err)
+		t.Errorf("error clearing manager identity: %v", err)
 	}
-	t.Log("set current version's metadata to have \"temporal.io/ignore-last-modifier\"=\"true\"")
+	t.Logf("cleared manager identity")
 }
 
-func validateIgnoreLastModifierMetadata(expectShouldIgnore bool) func(t *testing.T, ctx context.Context, tc testhelpers.TestCase, env testhelpers.TestEnv) {
+// validateManagerIdentity checks that the Worker Deployment's ManagerIdentity matches expected.
+func validateManagerIdentity(expected string) func(t *testing.T, ctx context.Context, tc testhelpers.TestCase, env testhelpers.TestEnv) {
 	return func(t *testing.T, ctx context.Context, tc testhelpers.TestCase, env testhelpers.TestEnv) {
 		workerDeploymentName := k8s.ComputeWorkerDeploymentName(tc.GetTWD())
 		deploymentHandle := env.Ts.GetDefaultClient().WorkerDeploymentClient().GetHandle(workerDeploymentName)
@@ -345,14 +354,10 @@ func validateIgnoreLastModifierMetadata(expectShouldIgnore bool) func(t *testing
 		desc, err := deploymentHandle.Describe(ctx, temporalClient.WorkerDeploymentDescribeOptions{})
 		if err != nil {
 			t.Errorf("error describing worker deployment: %v", err)
+			return
 		}
-
-		shouldIgnore, err := temporal.DeploymentShouldIgnoreLastModifier(ctx, deploymentHandle, desc.Info.RoutingConfig)
-		if err != nil {
-			t.Errorf("error checking ignore last modifier for worker deployment: %v", err)
-		}
-		if shouldIgnore != expectShouldIgnore {
-			t.Errorf("expected ignore last modifier to be %v, got %v", expectShouldIgnore, shouldIgnore)
+		if desc.Info.ManagerIdentity != expected {
+			t.Errorf("expected manager identity to be %q, got %q", expected, desc.Info.ManagerIdentity)
 		}
 	}
 }

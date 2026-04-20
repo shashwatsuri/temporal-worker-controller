@@ -6,6 +6,7 @@ package v1alpha1
 
 import (
 	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -26,16 +27,38 @@ type WorkerOptions struct {
 	// The Temporal namespace for the worker to connect to.
 	// +kubebuilder:validation:MinLength=1
 	TemporalNamespace string `json:"temporalNamespace"`
+	// UnsafeCustomBuildID optionally overrides the auto-generated build ID for this worker deployment.
+	// When set, the controller uses this value instead of computing a build ID from the
+	// pod template hash. This enables rolling updates for non-workflow code changes
+	// (bug fixes, config changes) while preserving the same build ID.
+	//
+	// WARNING: Using a custom build ID requires careful management. If workflow code changes
+	// but UnsafeCustomBuildID stays the same, pinned workflows may execute on workers running incompatible
+	// code. Only use this when you have a reliable way to detect changes in your workflow
+	// definitions (e.g., hashing workflow source files in CI/CD).
+	//
+	// When the UnsafeCustomBuildID is stable but pod template spec changes, the controller triggers
+	// a rolling update instead of creating a new deployment version. The controller uses
+	// a hash of the user-provided pod template spec to detect ANY changes, including
+	// container images, env vars, commands, volumes, resources, and all other fields.
+	// +optional
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$`
+	UnsafeCustomBuildID string `json:"unsafeCustomBuildID,omitempty"`
 }
 
 // TemporalWorkerDeploymentSpec defines the desired state of TemporalWorkerDeployment
 type TemporalWorkerDeploymentSpec struct {
 
-	// Number of desired pods. This is a pointer to distinguish between explicit
-	// zero and not specified. Defaults to 1.
+	// Number of desired pods. When set, the controller manages replicas for all active
+	// worker versions. When omitted (nil), the controller creates versioned Deployments
+	// with nil replicas and never calls UpdateScale on active versions — following the
+	// Kubernetes-recommended pattern for HPA and other external autoscalers
+	// (https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/#migrating-deployments-and-statefulsets-to-horizontal-autoscaling).
+	// The controller still scales drained versions (and inactive versions that are not
+	// the rollout target) to zero regardless.
 	// This field makes TemporalWorkerDeploymentSpec implement the scale subresource, which is compatible with auto-scalers.
 	// +optional
-	// +kubebuilder:default=1
 	Replicas *int32 `json:"replicas,omitempty" protobuf:"varint,1,opt,name=replicas"`
 
 	// Template describes the pods that will be created.
@@ -66,6 +89,55 @@ type TemporalWorkerDeploymentSpec struct {
 	// WorkerOptions configures the worker's connection to Temporal.
 	WorkerOptions WorkerOptions `json:"workerOptions"`
 }
+
+// Condition reason constants for TemporalWorkerDeployment.
+//
+// These strings appear in status.conditions[].reason and are part of the CRD's
+// status API. Operators, monitoring rules, and scripts may depend on them.
+// They should be treated as stable within an API version and renamed only with
+// a corresponding version bump.
+const (
+	// ReasonRolloutComplete is set on ConditionReady=True and ConditionProgressing=False
+	// when the target version has been successfully registered as the current version.
+	ReasonRolloutComplete = "RolloutComplete"
+
+	// ReasonWaitingForPollers is set on ConditionProgressing=True when the target
+	// version's Kubernetes Deployment has been created but the version is not yet
+	// registered with Temporal (workers have not started polling yet).
+	ReasonWaitingForPollers = "WaitingForPollers"
+
+	// ReasonWaitingForPromotion is set on ConditionProgressing=True when the target
+	// version is registered with Temporal (Inactive) but has not yet been promoted
+	// to current or ramping.
+	ReasonWaitingForPromotion = "WaitingForPromotion"
+
+	// ReasonRamping is set on ConditionProgressing=True when the target version is
+	// the ramping version and is receiving a configured percentage of new workflows.
+	ReasonRamping = "Ramping"
+
+	// ReasonTemporalConnectionNotFound is set on ConditionProgressing=False when the
+	// referenced TemporalConnection resource cannot be found.
+	ReasonTemporalConnectionNotFound = "TemporalConnectionNotFound"
+
+	// ReasonAuthSecretInvalid is set on ConditionProgressing=False when the credential
+	// secret referenced by the TemporalConnection is misconfigured. This covers:
+	// (1) the secret reference has an empty name, (2) the named Kubernetes Secret
+	// cannot be fetched or has an unexpected type, and (3) the mTLS certificate in
+	// the secret is expired or about to expire.
+	ReasonAuthSecretInvalid = "AuthSecretInvalid"
+
+	// ReasonTemporalClientCreationFailed is set on ConditionProgressing=False when the
+	// Temporal SDK client cannot connect to the server (dial failure or failed health
+	// check). The credentials were valid; the server itself is unreachable.
+	ReasonTemporalClientCreationFailed = "TemporalClientCreationFailed"
+
+	// ReasonTemporalStateFetchFailed is set on ConditionProgressing=False when the
+	// controller cannot query the current worker deployment state from Temporal.
+	ReasonTemporalStateFetchFailed = "TemporalStateFetchFailed"
+
+	// Deprecated: Use ReasonRolloutComplete on ConditionReady instead.
+	ReasonTemporalConnectionHealthy = "TemporalConnectionHealthy"
+)
 
 // VersionStatus indicates the status of a version.
 // +enum
@@ -130,14 +202,21 @@ type TemporalWorkerDeploymentStatus struct {
 	// +optional
 	LastModifierIdentity string `json:"lastModifierIdentity,omitempty"`
 
+	// ManagerIdentity is the identity that has exclusive rights to modify this Worker Deployment's routing config.
+	// When set, clients whose identity does not match will be blocked from making routing changes.
+	// Empty by default. Use `temporal worker deployment manager-identity set/unset` to change.
+	// +optional
+	ManagerIdentity string `json:"managerIdentity,omitempty"`
+
 	// VersionCount is the total number of versions currently known by the worker deployment.
 	// This includes current, target, ramping, and deprecated versions.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	VersionCount int32 `json:"versionCount,omitempty"`
 
-	// TODO(jlegrone): Add additional status fields following Kubernetes API conventions
-	// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#spec-and-status
+	// Conditions represent the latest available observations of the TemporalWorkerDeployment's current state.
+	// +optional
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
 // WorkflowExecutionStatus describes the current state of a workflow.
@@ -241,9 +320,14 @@ type DeprecatedWorkerDeploymentVersion struct {
 	// +optional
 	DrainedSince *metav1.Time `json:"drainedSince,omitempty"`
 
-	// A Version is eligible for deletion if it is drained and has no pollers on any task queue.
-	// After pollers stop polling, the server will still consider them present until `matching.PollerHistoryTTL`
-	// has passed.
+	// A Version is considered eligible for deletion if it is drained and has no
+	// controller-managed workers with active replicas polling on its task queues.
+	// The server automatically deletes eligible versions when it needs to make room for new ones.
+	// If this version has pollers that are not managed by the controller, the server
+	// will not be able to delete the version. `EligibleForDeletion=true` does not consider
+	// that scenario, because it is rare and it is too expensive to cover (requires describing
+	// every drained version without controller-managed pollers and all task queues in
+	// that version).
 	// +optional
 	EligibleForDeletion bool `json:"eligibleForDeletion,omitempty"`
 }
@@ -273,6 +357,25 @@ const (
 
 type GateWorkflowConfig struct {
 	WorkflowType string `json:"workflowType"`
+	// Input is an arbitrary JSON object passed as the first parameter to the gate workflow.
+	// For inputs with secrets use SecretKeyRef in InputFrom to omit from logs.
+	// +optional
+	Input *apiextensionsv1.JSON `json:"input,omitempty"`
+	// InputFrom references a key in a ConfigMap or Secret whose contents are passed
+	// as the first parameter to the gate workflow. The referenced value should be a JSON document.
+	// For inputs with secrets use SecretKeyRef to omit from logs.
+	// +optional
+	InputFrom *GateInputSource `json:"inputFrom,omitempty"`
+}
+
+// GateInputSource references a value from a ConfigMap or a Secret
+type GateInputSource struct {
+	// Select a key of a ConfigMap in the same namespace
+	// +optional
+	ConfigMapKeyRef *corev1.ConfigMapKeySelector `json:"configMapKeyRef,omitempty"`
+	// Select a key of a Secret in the same namespace
+	// +optional
+	SecretKeyRef *corev1.SecretKeySelector `json:"secretKeyRef,omitempty"`
 }
 
 // RolloutStrategy defines strategy to apply during next rollout

@@ -150,28 +150,52 @@ help: ## Display this help.
 
 # crd:maxDescLen=0 is to avoid error described in https://github.com/kubernetes-sigs/kubebuilder/issues/2556#issuecomment-1074844483
 .PHONY: manifests
-manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
-	GOWORK=off GO111MODULE=on $(CONTROLLER_GEN) rbac:roleName=manager-role crd:allowDangerousTypes=true,maxDescLen=0,generateEmbeddedObjectMeta=true webhook paths=./api/... paths=./internal/... paths=./cmd/... \
-    output:crd:artifacts:config=helm/temporal-worker-controller/templates/crds
+manifests: controller-gen ## Generate ClusterRole and CustomResourceDefinition objects.
+	GOWORK=off GO111MODULE=on $(CONTROLLER_GEN) rbac:roleName=manager-role crd:allowDangerousTypes=true,maxDescLen=0,generateEmbeddedObjectMeta=true paths=./api/... paths=./internal/... paths=./cmd/... \
+    output:crd:artifacts:config=helm/temporal-worker-controller-crds/templates
 
 .PHONY: generate
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
 	GOWORK=off GO111MODULE=on $(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths=./api/... paths=./internal/... paths=./cmd/...
 
-# source secret.env && make start-sample-workflow TEMPORAL_CLOUD_API_KEY=$TEMPORAL_CLOUD_API_KEY
 .PHONY: start-sample-workflow
+.SILENT: start-sample-workflow
 start-sample-workflow: ## Start a sample workflow.
-	@$(TEMPORAL) workflow start --type "HelloWorld" --task-queue "default/helloworld" \
-      --tls-cert-path certs/client.pem \
-      --tls-key-path certs/client.key \
-      --address "worker-controller-test.a2dd6.tmprl.cloud:7233" \
-      -n "worker-controller-test.a2dd6"
-#      --address replay-2025.ktasd.tmprl.cloud:7233 \
-#      --api-key $(TEMPORAL_CLOUD_API_KEY)
+	@set -e; \
+	# Load env vars from skaffold.env if present so address/namespace aren't hardcoded
+	if [ -f skaffold.env ]; then set -a; . skaffold.env; set +a; fi; \
+	API_KEY_VAL=""; \
+	if [ -n "$$TEMPORAL_API_KEY" ]; then API_KEY_VAL="$$TEMPORAL_API_KEY"; \
+	elif [ -f certs/api-key.txt ]; then API_KEY_VAL="$$(tr -d '\r\n' < certs/api-key.txt)"; fi; \
+	if [ -n "$$API_KEY_VAL" ]; then \
+	  $(TEMPORAL) workflow start --type "HelloWorld" --task-queue "default/helloworld" \
+	    --address "$$TEMPORAL_ADDRESS" \
+	    --namespace "$$TEMPORAL_NAMESPACE" \
+	    --api-key "$$API_KEY_VAL"; \
+	else \
+	  $(TEMPORAL) workflow start --type "HelloWorld" --task-queue "default/helloworld" \
+	    --tls-cert-path certs/client.pem \
+	    --tls-key-path certs/client.key \
+	    --address "$$TEMPORAL_ADDRESS" \
+	    --namespace "$$TEMPORAL_NAMESPACE"; \
+	fi
 
 .PHONY: apply-load-sample-workflow
+.SILENT: apply-load-sample-workflow
 apply-load-sample-workflow: ## Start a sample workflow every 15 seconds
-	watch --interval 0.1 -- $(TEMPORAL) workflow start --type "HelloWorld" --task-queue "default/helloworld"
+	@while true; do \
+		$(MAKE) -s start-sample-workflow; \
+		sleep 15; \
+	done
+
+.PHONY: apply-hpa-load
+.SILENT: apply-hpa-load
+apply-hpa-load: ## Start ~2 workflows/sec to build a backlog and drive HPA scaling to ~10 replicas
+	@echo "Starting load at ~2 workflows/sec. Press Ctrl-C to stop."
+	@while true; do \
+		$(MAKE) -s start-sample-workflow & \
+		sleep 0.5; \
+	done
 
 .PHONY: list-workflow-build-ids
 list-workflow-build-ids: ## List workflow executions and their build IDs.
@@ -199,8 +223,8 @@ test-all: manifests generate envtest ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test -tags test_dep ./... -coverprofile cover.out
 
 .PHONY: test-unit
-test-unit: ## Run unit tests with minimal setup.
-	go test ./... -coverprofile cover.out
+test-unit: envtest ## Run unit tests and webhook integration tests (requires envtest binaries).
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test ./... -coverprofile cover.out
 
 .PHONY: test-integration
 test-integration: manifests generate envtest ## Run integration tests against local Temporal dev server.
@@ -253,15 +277,16 @@ endif
 
 .PHONY: install
 install: manifests ## Install CRDs into the K8s cluster specified in ~/.kube/config.
-	$(KUBECTL) apply --context $(K8S_CONTEXT) -f helm/temporal-worker-controller/templates/crds
+	$(KUBECTL) apply --context $(K8S_CONTEXT) -f helm/temporal-worker-controller-crds/templates
 
 .PHONY: uninstall
 uninstall: manifests ## Uninstall CRDs from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
-	$(KUBECTL) delete --context $(K8S_CONTEXT) --ignore-not-found=$(ignore-not-found) -f helm/temporal-worker-controller/templates/crds
+	$(KUBECTL) delete --context $(K8S_CONTEXT) --ignore-not-found=$(ignore-not-found) -f helm/temporal-worker-controller-crds/templates
 
 .PHONY: deploy
 deploy: manifests helm ## Deploy controller to the K8s cluster specified in ~/.kube/config.
-	helm install temporal-worker-controller ./helm/temporal-worker-controller --create-namespace --namespace temporal-system
+	helm install temporal-worker-controller-crds ./helm/temporal-worker-controller-crds --create-namespace --namespace temporal-system
+	helm install temporal-worker-controller ./helm/temporal-worker-controller --namespace temporal-system
 
 .PHONY: undeploy
 undeploy: ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
@@ -299,6 +324,11 @@ create-cloud-mtls-secret:
 	kubectl create secret tls temporal-cloud-mtls --namespace default \
       --cert=certs/client.pem \
       --key=certs/client.key
+
+.PHONY: create-api-key-secret
+create-api-key-secret:
+	kubectl create secret generic temporal-api-key --namespace default \
+      --from-file=api-key=certs/api-key.txt
 
 ##### Checks #####
 goimports: fmt-imports $(GOIMPORTS)

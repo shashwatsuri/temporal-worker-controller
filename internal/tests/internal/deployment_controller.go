@@ -14,6 +14,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -91,8 +92,8 @@ func applyDeployment(t *testing.T, ctx context.Context, k8sClient client.Client,
 		go testhelpers.RunHelloWorldWorker(ctx, deployment.Spec.Template, workerCallback(i))
 	}
 
-	// wait 10s for all expected workers to be healthy
-	timedOut := waitTimeout(&wg, 10*time.Second)
+	// wait 30s for all expected workers to be healthy (under suite load startup can be slower)
+	timedOut := waitTimeout(&wg, 30*time.Second)
 
 	if timedOut {
 		t.Fatalf("could not start workers, errors were: %+v", workerErrors)
@@ -103,44 +104,54 @@ func applyDeployment(t *testing.T, ctx context.Context, k8sClient client.Client,
 	return stopFuncs
 }
 
-// Set deployment status to `DeploymentAvailable` to simulate a healthy deployment
-// This is necessary because envtest doesn't actually start pods
+// Set deployment status to `DeploymentAvailable` to simulate a healthy deployment.
+// This is necessary because envtest doesn't actually start pods.
+// Uses retry-on-conflict because the controller may update the Deployment (e.g. rolling
+// update) between our Get and Status().Update(), bumping the resourceVersion.
 func setHealthyDeploymentStatus(t *testing.T, ctx context.Context, k8sClient client.Client, deployment appsv1.Deployment) {
-	now := metav1.Now()
-	deployment.Status = appsv1.DeploymentStatus{
-		Replicas:            *deployment.Spec.Replicas,
-		UpdatedReplicas:     *deployment.Spec.Replicas,
-		ReadyReplicas:       *deployment.Spec.Replicas,
-		AvailableReplicas:   *deployment.Spec.Replicas,
-		UnavailableReplicas: 0,
-		Conditions: []appsv1.DeploymentCondition{
-			{
-				Type:               appsv1.DeploymentAvailable,
-				Status:             corev1.ConditionTrue,
-				LastUpdateTime:     now,
-				LastTransitionTime: now,
-				Reason:             "MinimumReplicasAvailable",
-				Message:            "Deployment has minimum availability.",
+	t.Helper()
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var fresh appsv1.Deployment
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: deployment.Name, Namespace: deployment.Namespace}, &fresh); err != nil {
+			return err
+		}
+		now := metav1.Now()
+		fresh.Status = appsv1.DeploymentStatus{
+			Replicas:            *fresh.Spec.Replicas,
+			UpdatedReplicas:     *fresh.Spec.Replicas,
+			ReadyReplicas:       *fresh.Spec.Replicas,
+			AvailableReplicas:   *fresh.Spec.Replicas,
+			UnavailableReplicas: 0,
+			Conditions: []appsv1.DeploymentCondition{
+				{
+					Type:               appsv1.DeploymentAvailable,
+					Status:             corev1.ConditionTrue,
+					LastUpdateTime:     now,
+					LastTransitionTime: now,
+					Reason:             "MinimumReplicasAvailable",
+					Message:            "Deployment has minimum availability.",
+				},
+				{
+					Type:               appsv1.DeploymentProgressing,
+					Status:             corev1.ConditionTrue,
+					LastUpdateTime:     now,
+					LastTransitionTime: now,
+					Reason:             "NewReplicaSetAvailable",
+					Message:            "ReplicaSet is available.",
+				},
 			},
-			{
-				Type:               appsv1.DeploymentProgressing,
-				Status:             corev1.ConditionTrue,
-				LastUpdateTime:     now,
-				LastTransitionTime: now,
-				Reason:             "NewReplicaSetAvailable",
-				Message:            "ReplicaSet is available.",
-			},
-		},
-	}
-	t.Logf("started %d healthy workers, updating deployment status", *deployment.Spec.Replicas)
-	if err := k8sClient.Status().Update(ctx, &deployment); err != nil {
-		t.Fatalf("failed to update deployment status: %v", err)
+		}
+		return k8sClient.Status().Update(ctx, &fresh)
+	})
+	if err != nil {
+		t.Fatalf("failed to update deployment status after retries: %v", err)
 	}
 }
 
 // Uses input.Status + existingDeploymentReplicas to create (and maybe kill) pollers for deprecated versions in temporal
 // also gets routing config of the deployment into the starting state before running the test.
 // Does not set Status.VersionConflictToken, since that is only set internally by the server.
+// Returns stop functions for all started workers that the caller must defer to ensure cleanup.
 func makePreliminaryStatusTrue(
 	ctx context.Context,
 	t *testing.T,
@@ -191,30 +202,32 @@ func createStatus(
 		workerDeploymentName := k8s.ComputeWorkerDeploymentName(newTWD)
 		v := &worker.WorkerDeploymentVersion{
 			DeploymentName: workerDeploymentName,
-			BuildId:        prevVersion.BuildID,
+			BuildID:        prevVersion.BuildID,
 		}
-		prevTWD := recreateTWD(newTWD, env.ExistingDeploymentImages[v.BuildId], env.ExistingDeploymentReplicas[v.BuildId])
-		createWorkerDeployment(ctx, t, env, prevTWD, v.BuildId)
+		prevTWD := recreateTWD(newTWD, env.ExistingDeploymentImages[v.BuildID], env.ExistingDeploymentReplicas[v.BuildID])
+		createWorkerDeployment(ctx, t, env, prevTWD, v.BuildID)
 		expectedDeploymentName := k8s.ComputeVersionedDeploymentName(prevTWD.Name, k8s.ComputeBuildID(prevTWD))
-		waitForDeployment(t, env.K8sClient, expectedDeploymentName, prevTWD.Namespace, 30*time.Second)
+		waitForExpectedTargetDeployment(t, prevTWD, env, 30*time.Second)
 		workerStopFuncs = applyDeployment(t, ctx, env.K8sClient, expectedDeploymentName, prevTWD.Namespace)
 
 		switch prevVersion.Status {
-		case temporaliov1alpha1.VersionStatusInactive, temporaliov1alpha1.VersionStatusNotRegistered:
+		case temporaliov1alpha1.VersionStatusNotRegistered:
 			// no-op
+		case temporaliov1alpha1.VersionStatusInactive:
+			waitForVersionRegistrationInDeployment(t, ctx, env.Ts, v)
 		case temporaliov1alpha1.VersionStatusRamping:
-			setRampingVersion(t, ctx, env.Ts, v.DeploymentName, v.BuildId, *rampPercentage) // rampPercentage won't be nil if the version is ramping
+			setRampingVersion(t, ctx, env.Ts, v.DeploymentName, v.BuildID, *rampPercentage) // rampPercentage won't be nil if the version is ramping
 		case temporaliov1alpha1.VersionStatusCurrent:
-			setCurrentVersion(t, ctx, env.Ts, v.DeploymentName, v.BuildId)
+			setCurrentVersion(t, ctx, env.Ts, v.DeploymentName, v.BuildID)
 		case temporaliov1alpha1.VersionStatusDraining:
-			setRampingVersion(t, ctx, env.Ts, v.DeploymentName, v.BuildId, 1)
+			setRampingVersion(t, ctx, env.Ts, v.DeploymentName, v.BuildID, 1)
 			// TODO(carlydf): start a workflow on v that does not complete -> will never drain
 			setRampingVersion(t, ctx, env.Ts, v.DeploymentName, "", 0)
 		case temporaliov1alpha1.VersionStatusDrained:
-			if env.ExistingDeploymentReplicas[v.BuildId] == 0 {
+			if env.ExistingDeploymentReplicas[v.BuildID] == 0 {
 				startAndStopWorker(t, ctx, env.K8sClient, expectedDeploymentName, prevTWD.Namespace)
 			}
-			setCurrentVersion(t, ctx, env.Ts, v.DeploymentName, v.BuildId)
+			setCurrentVersion(t, ctx, env.Ts, v.DeploymentName, v.BuildID)
 			setCurrentVersion(t, ctx, env.Ts, v.DeploymentName, "")
 		}
 	}

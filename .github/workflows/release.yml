@@ -35,7 +35,7 @@ jobs:
           check-latest: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f95db51fddba0c2d1ec667646a06c2ce06100226 # v3.0.0
+        uses: docker/setup-buildx-action@v3
 
       - name: Login to Docker Hub
         uses: docker/login-action@465a07811f14bebb1938fbed4728c6a1ff8901fc # v2.2.0
@@ -51,6 +51,7 @@ jobs:
           args: release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BUILDKIT_INLINE_CACHE: 1
 
   helm:
     needs: release
@@ -95,43 +96,61 @@ jobs:
         id: bump_version
         run: |
           # Get current version from Chart.yaml
-          CURRENT_VERSION=$(grep 'version:' helm/temporal-worker-controller/Chart.yaml | awk '{print $2}')
+          CURRENT_VERSION=$(grep '^version:' helm/temporal-worker-controller/Chart.yaml | awk '{print $2}')
           echo "Current version: $CURRENT_VERSION"
 
-          # Split version into parts
+          # Determine if this is a patch release based on the git tag
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          TAG_PATCH=$(echo "$TAG_VERSION" | awk -F. '{print $3}')
+
+          # Split chart version into parts
           IFS='.' read -r -a VERSION_PARTS <<< "$CURRENT_VERSION"
           MAJOR=${VERSION_PARTS[0]}
           MINOR=${VERSION_PARTS[1]}
           PATCH=${VERSION_PARTS[2]}
 
-          MINOR=$((MINOR + 1))
-          PATCH=0
+          if [[ "$TAG_PATCH" == "0" ]]; then
+            # Non-patch release: bump chart minor version
+            MINOR=$((MINOR + 1))
+            PATCH=0
+          else
+            # Patch release: bump chart patch version
+            PATCH=$((PATCH + 1))
+          fi
 
           NEW_VERSION="$MAJOR.$MINOR.$PATCH"
           echo "New version: $NEW_VERSION"
 
-          # Update Chart.yaml with new version and appVersion
-          sed -i "s/version: .*/version: $NEW_VERSION/" helm/temporal-worker-controller/Chart.yaml
+          # Update Chart.yaml with new version and appVersion.
+          # Use ^version: to only match the top-level chart version, not indented
+          # dependency versions (e.g. cert-manager) which would otherwise be overwritten.
+          sed -i "s/^version: .*/version: $NEW_VERSION/" helm/temporal-worker-controller/Chart.yaml
           sed -i "s/appVersion: .*/appVersion: ${GITHUB_REF_NAME#v}/" helm/temporal-worker-controller/Chart.yaml
+
+          # Also bump CRDs chart version
+          sed -i "s/^version: .*/version: $NEW_VERSION/" helm/temporal-worker-controller-crds/Chart.yaml
 
           # Set output variable for use in later steps
           echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
 
-          # Commit the change
+          # Commit both Chart.yaml files
           git add helm/temporal-worker-controller/Chart.yaml
+          git add helm/temporal-worker-controller-crds/Chart.yaml
           git commit -m "Bump chart version to $NEW_VERSION [skip ci]"
           git push
 
-      - name: Package and Push Helm chart
+      - name: Package and Push Helm charts
         run: |
           # Use version from previous step
           VERSION=${{ steps.bump_version.outputs.version }}
           echo "Chart version: $VERSION"
 
-          # Package the chart
+          # Package and push the CRDs chart
+          helm package ./helm/temporal-worker-controller-crds
+          helm push temporal-worker-controller-crds-${VERSION}.tgz oci://docker.io/temporalio
+          echo "✅ CRDs chart pushed successfully to oci://docker.io/temporalio/temporal-worker-controller-crds:${VERSION}"
+
+          # Package and push the controller chart
           helm package ./helm/temporal-worker-controller
-
-          # Push to Docker Hub
           helm push temporal-worker-controller-${VERSION}.tgz oci://docker.io/temporalio
-
-          echo "✅ Chart pushed successfully to oci://docker.io/temporalio/temporal-worker-controller:${VERSION}"
+          echo "✅ Controller chart pushed successfully to oci://docker.io/temporalio/temporal-worker-controller:${VERSION}"
