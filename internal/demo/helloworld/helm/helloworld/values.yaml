@@ -1,6 +1,7 @@
 image:
   repository: helloworld
   tag: latest
+  pullPolicy: IfNotPresent  # Use locally loaded Skaffold images in dev clusters
 
 temporal:
   namespace: "" # e.g. default

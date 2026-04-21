@@ -197,6 +197,21 @@ apply-hpa-load: ## Start ~2 workflows/sec to build a backlog and drive HPA scali
 		sleep 0.5; \
 	done
 
+.PHONY: demo
+.SILENT: demo
+demo: ## Run the full rainbow demo: continuous load + version rolling. Open http://localhost:8787 to watch. Ctrl-C to stop.
+	@echo "Starting rainbow demo..."
+	@echo "  Load:     ~1 workflow/sec (pinned workflows sleep 90-300s)"
+	@echo "  Versions: new version every 90s"
+	@echo "  Dashboard: http://localhost:8787"
+	@echo ""
+	@(while true; do $(MAKE) -s start-sample-workflow; sleep 1; done) & \
+	LOAD_PID=$$!; \
+	(DELAY_SECONDS=90 sh internal/demo/scripts/continuous_versions.sh) & \
+	VERSIONS_PID=$$!; \
+	trap "kill $$LOAD_PID $$VERSIONS_PID 2>/dev/null; exit 0" INT TERM; \
+	wait
+
 .PHONY: list-workflow-build-ids
 list-workflow-build-ids: ## List workflow executions and their build IDs.
 	@$(TEMPORAL) workflow list --limit 20 --fields SearchAttributes -o json | \

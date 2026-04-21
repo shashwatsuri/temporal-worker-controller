@@ -108,6 +108,43 @@ This guide will help you set up and run the Temporal Worker Controller locally u
    - v2 workers handle new workflow executions with the updated code
    - This demonstrates how **Progressive rollout** safely handles breaking changes when you have existing traffic
 
+#### Additional Rainbow Versions
+
+After `no-version-gate.patch`, apply these patches one-by-one to create more concurrent versions:
+
+```bash
+git apply internal/demo/helloworld/changes/add-timer-and-email-greeting.patch
+skaffold run --profile helloworld-worker
+
+git apply internal/demo/helloworld/changes/increase-timer-v2.patch
+skaffold run --profile helloworld-worker
+
+git apply internal/demo/helloworld/changes/add-second-timer-v3.patch
+skaffold run --profile helloworld-worker
+```
+
+For a faster visual effect, use higher load while rolling versions:
+
+```bash
+make apply-hpa-load
+```
+
+### Rainbow Automation Scripts
+
+Apply one patch + deploy (and ensure load is running):
+
+```bash
+internal/demo/scripts/rainbow_step.sh internal/demo/helloworld/changes/add-timer-and-email-greeting.patch
+```
+
+Reset back to baseline worker code and redeploy:
+
+```bash
+internal/demo/scripts/reset_rainbow_demo.sh
+```
+
+By default this performs a hard reset (`HARD_RESET=1`): it deletes the existing `helloworld` release/TWD first, then redeploys baseline so old build IDs are cleared. The dashboard UI process is not stopped automatically.
+
 ### Monitoring 
 
 You can monitor the controller's logs and the worker's status using:
@@ -118,6 +155,32 @@ kubectl logs -n temporal-system deployments/temporal-worker-controller-manager -
 # View TemporalWorkerDeployment status
 kubectl get twd
 ```
+
+### Live Rainbow Demo UI
+
+For a lightweight live view while you apply load and roll changes, run the local dashboard:
+
+```bash
+cd internal/demo
+go run ./dashboard --namespace default --name helloworld --port 8787
+```
+
+Then open `http://localhost:8787`.
+
+The dashboard auto-refreshes every 1 second and shows:
+- Active/current/target/deprecated worker versions
+- Traffic split when the target version is ramping
+- Per-version deployment readiness
+- Progressing/Ready/TemporalConnection conditions
+- A pinned-workflow signal (when deprecated versions are `Draining`)
+- Live slot utilization from Prometheus metrics
+
+**Important**: The dashboard now detects code patches properly because:
+1. The Helm template includes a dynamic timestamp annotation that changes on every deploy
+2. Kubernetes is configured to always pull the latest image (`imagePullPolicy: Always`)
+3. When you run `skaffold run` after applying a patch, the pods will restart automatically even if the image tag hasn't changed
+
+This means when you apply a patch and redeploy, the UI will show the new version appearing within 1-2 seconds.
 
 ### Testing WorkerResourceTemplate (per-version HPA)
 

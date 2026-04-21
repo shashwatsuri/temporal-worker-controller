@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Temporal Rainbow Demo</title>
+  <style>
+    :root {
+      --bg-0: #0b1020;
+      --bg-1: #101a32;
+      --card: rgba(255, 255, 255, 0.06);
+      --line: rgba(255, 255, 255, 0.15);
+      --text: #f3f7ff;
+      --muted: #aac0ef;
+      --good: #18c964;
+      --warn: #f5a524;
+      --bad: #f31260;
+      --accent-a: #4f46e5;
+      --accent-b: #0284c7;
+      --accent-c: #10b981;
+      --accent-d: #f97316;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(1200px 600px at 10% -20%, rgba(79, 70, 229, 0.25), transparent 60%),
+        radial-gradient(900px 500px at 100% 0%, rgba(2, 132, 199, 0.25), transparent 55%),
+        linear-gradient(160deg, var(--bg-0), var(--bg-1));
+      min-height: 100vh;
+    }
+
+    .wrap {
+      max-width: 1060px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+
+    .header {
+      display: flex;
+      gap: 12px;
+      justify-content: space-between;
+      align-items: end;
+      margin-bottom: 16px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(24px, 4vw, 38px);
+      line-height: 1.05;
+      letter-spacing: 0.2px;
+    }
+
+    .sub {
+      color: var(--muted);
+      font-size: 14px;
+      margin-top: 6px;
+    }
+
+    .pill {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 8px 12px;
+      color: var(--muted);
+      font-size: 13px;
+      backdrop-filter: blur(6px);
+    }
+
+    .grid {
+      display: grid;
+      gap: 14px;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      margin-bottom: 16px;
+    }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 14px;
+      backdrop-filter: blur(6px);
+    }
+
+    .label {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+    }
+
+    .value {
+      margin-top: 6px;
+      font-size: 26px;
+      font-weight: 700;
+      line-height: 1;
+    }
+
+    .hint {
+      margin-top: 7px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .status {
+      margin-bottom: 16px;
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      background: rgba(0, 0, 0, 0.18);
+      font-size: 14px;
+    }
+
+    .ok { border-color: rgba(24, 201, 100, 0.45); }
+    .warn { border-color: rgba(245, 165, 36, 0.45); }
+    .bad { border-color: rgba(243, 18, 96, 0.45); }
+
+    .versions {
+      display: grid;
+      gap: 12px;
+    }
+
+    .version-row {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 12px;
+      background: rgba(7, 12, 26, 0.5);
+    }
+
+    .row-top {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: baseline;
+    }
+
+    .badge {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 2px 8px;
+      color: var(--muted);
+      margin-right: 8px;
+    }
+
+    .build {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 13px;
+      color: #dbe8ff;
+      word-break: break-all;
+    }
+
+    .traffic {
+      min-width: 220px;
+      max-width: 360px;
+      width: 100%;
+    }
+
+    .bar {
+      margin-top: 8px;
+      height: 10px;
+      border-radius: 999px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.05);
+    }
+
+    .fill {
+      height: 100%;
+      width: 0%;
+      transition: width 300ms ease;
+      background: linear-gradient(90deg, var(--accent-a), var(--accent-b));
+    }
+
+    .meta {
+      margin-top: 8px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .footer {
+      margin-top: 16px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    @media (max-width: 900px) {
+      .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+
+    @media (max-width: 560px) {
+      .grid { grid-template-columns: 1fr; }
+      .traffic { min-width: 0; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="header">
+      <div>
+        <h1>Pinned Workflow + Rainbow Rollout</h1>
+        <div class="sub" id="scope">Loading deployment scope...</div>
+      </div>
+      <div class="pill" id="tick">Refreshing...</div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <div class="label">Active Versions</div>
+        <div class="value" id="activeVersions">-</div>
+        <div class="hint">Concurrent worker versions serving traffic or draining</div>
+      </div>
+      <div class="card">
+        <div class="label">Slot Utilization</div>
+        <div class="value" id="slotUtilization">-</div>
+        <div class="hint" id="slotHint">Live from Prometheus</div>
+      </div>
+      <div class="card">
+        <div class="label">Slots Used</div>
+        <div class="value" id="slotsUsed">-</div>
+        <div class="hint" id="slotsCapacity">Capacity: -</div>
+      </div>
+      <div class="card">
+        <div class="label">Ready Condition</div>
+        <div class="value" id="ready">-</div>
+        <div class="hint" id="readyReason">-</div>
+      </div>
+    </div>
+
+    <div class="status" id="statusMsg">Loading state...</div>
+
+    <div class="versions" id="versions"></div>
+
+    <div class="footer">
+      Tip: keep this open while running load and applying patches. You should see ramp percentages, old versions draining, and active versions overlap during rainbow rollout.
+    </div>
+  </div>
+
+  <script>
+    const statusEl = document.getElementById("statusMsg");
+    const versionsEl = document.getElementById("versions");
+
+    function fmtPct(v) {
+      if (typeof v !== "number") return "n/a";
+      return `${v.toFixed(1)}%`;
+    }
+
+    function cardColor(role, index) {
+      const palette = ["var(--accent-a)", "var(--accent-c)", "var(--accent-b)", "var(--accent-d)"];
+      if (role === "current") return "var(--accent-b)";
+      if (role === "target") return "var(--accent-c)";
+      return palette[index % palette.length];
+    }
+
+    function shortBuildId(buildId) {
+      if (!buildId || typeof buildId !== "string") return "unknown";
+      return buildId.length > 12 ? `${buildId.slice(0, 8)}...${buildId.slice(-4)}` : buildId;
+    }
+
+    function roleLabel(v) {
+      const role = (v.role || "").toLowerCase();
+      if (role.includes("current") && role.includes("target")) return "current+target";
+      if (role.includes("target")) return "target";
+      if (role.includes("current")) return "current";
+      if (role.includes("deprecated")) return "deprecated";
+      return role || "discovered";
+    }
+
+    function setStatusClass(level) {
+      statusEl.classList.remove("ok", "warn", "bad");
+      statusEl.classList.add(level);
+    }
+
+    function render(data) {
+      document.getElementById("scope").textContent = `${data.namespace}/${data.name}`;
+      document.getElementById("tick").textContent = `Updated ${new Date(data.fetchedAt).toLocaleTimeString()}`;
+      document.getElementById("activeVersions").textContent = String(data.activeVersions ?? 0);
+
+      const util = typeof data.slotUtilizationPct === "number" ? `${data.slotUtilizationPct.toFixed(1)}%` : "-";
+      document.getElementById("slotUtilization").textContent = util;
+      document.getElementById("slotHint").textContent = data.metricsNote || `Pinned likely: ${data.pinnedLikely ? "yes" : "no"}`;
+
+      const used = typeof data.slotsUsed === "number" ? data.slotsUsed.toFixed(1) : "-";
+      const cap = typeof data.slotsCapacity === "number" ? data.slotsCapacity.toFixed(1) : "-";
+      document.getElementById("slotsUsed").textContent = used;
+      document.getElementById("slotsCapacity").textContent = `Capacity: ${cap}`;
+
+      document.getElementById("ready").textContent = data.ready?.status === "True" ? "Ready" : "Not Ready";
+      document.getElementById("readyReason").textContent = data.ready?.reason || "-";
+
+      if (data.error) {
+        setStatusClass("bad");
+        statusEl.textContent = data.error;
+        versionsEl.innerHTML = "";
+        return;
+      }
+
+      const progressing = data.progressing;
+      if (progressing?.status === "True") {
+        setStatusClass("warn");
+        statusEl.textContent = `Progressing: ${progressing.reason || "InProgress"} - ${progressing.message || ""}`;
+      } else if (data.ready?.status === "True") {
+        setStatusClass("ok");
+        statusEl.textContent = `Ready: ${data.ready.reason || "RolloutComplete"}`;
+      } else {
+        setStatusClass("bad");
+        statusEl.textContent = `Not Ready: ${data.ready?.reason || "Unknown"} - ${data.ready?.message || ""}`;
+      }
+
+      versionsEl.innerHTML = "";
+      (data.versions || []).forEach((v, index) => {
+        const row = document.createElement("div");
+        row.className = "version-row";
+
+        const color = cardColor(v.role, index);
+        const versionLabel = shortBuildId(v.buildId);
+        const role = roleLabel(v);
+        const isDraining = v.draining === true;
+        const status = (v.status || "unknown").toLowerCase();
+
+        // Traffic bar logic:
+        // - current/ramping: show % of new workflow starts routed here
+        // - draining: show replica-based bar (they serve pinned workflows, not new starts)
+        // - inactive/other: empty bar
+        let trafficLabel, trafficBarPct;
+        if (isDraining) {
+          trafficLabel = `draining pinned workflows`;
+          // Show a bar proportional to ready replicas (max assumed 10 for display)
+          const maxReplicas = Math.max(v.replicas || 1, 10);
+          trafficBarPct = Math.min(100, ((v.readyReplicas || 0) / maxReplicas) * 100);
+        } else if (typeof v.trafficPct === "number") {
+          trafficLabel = `${v.trafficPct.toFixed(1)}% new workflows`;
+          trafficBarPct = Math.max(0, Math.min(100, v.trafficPct));
+        } else {
+          trafficLabel = status === "inactive" ? "registered, not ramping yet" : "no new workflows";
+          trafficBarPct = 0;
+        }
+
+        // Draining versions use a muted amber color to distinguish them from active routing
+        const barColor = isDraining ? "var(--warn)" : color;
+
+        row.innerHTML = `
+          <div class="row-top">
+            <div>
+              <span class="badge" style="color:${color};border-color:${color}">${versionLabel}</span>
+              <span class="badge">${role}</span>
+              <span class="badge" style="${isDraining ? `color:var(--warn);border-color:var(--warn)` : ``}">${status}</span>
+              <div class="build">${v.buildId || "unknown build id"}</div>
+            </div>
+            <div class="traffic">
+              <div>${trafficLabel}</div>
+              <div class="bar"><div class="fill" style="width:${trafficBarPct}%;background:${barColor}"></div></div>
+            </div>
+          </div>
+          <div class="meta">
+            <div>Deployment: ${v.deployment || "n/a"}</div>
+            <div>Replicas: ${v.readyReplicas || 0}/${v.replicas || 0} ready</div>
+          </div>
+        `;
+
+        versionsEl.appendChild(row);
+      });
+    }
+
+    async function refresh() {
+      try {
+        const res = await fetch("/api/state", { cache: "no-store" });
+        const data = await res.json();
+        render(data);
+      } catch (err) {
+        setStatusClass("bad");
+        statusEl.textContent = `Dashboard request failed: ${err?.message || err}`;
+      }
+    }
+
+    refresh();
+    setInterval(refresh, 1000);
+  </script>
+</body>
+</html>
