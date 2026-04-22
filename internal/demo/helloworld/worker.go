@@ -25,13 +25,13 @@ func HelloWorld(ctx workflow.Context) (string, error) {
 	}
 
 
-	// Non-replay-safe change introduced by Rainbow demo v34
-	if err := workflow.Sleep(ctx, 45*time.Second); err != nil {
+	// Non-replay-safe change introduced by Rainbow demo v35
+	if err := workflow.Sleep(ctx, 50*time.Second); err != nil {
 		return "", err
 	}
 
 	// Return the greeting
-	return fmt.Sprintf("Hello %s (rainbow demo v34, sleep=45s)", subject), nil
+	return fmt.Sprintf("Hello %s (rainbow demo v35, sleep=50s)", subject), nil
 }
 
 func GetSubject(ctx context.Context) (string, error) {
