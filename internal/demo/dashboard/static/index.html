@@ -15,10 +15,12 @@
       --good: #18c964;
       --warn: #f5a524;
       --bad: #f31260;
-      --accent-a: #4f46e5;
-      --accent-b: #0284c7;
-      --accent-c: #10b981;
-      --accent-d: #f97316;
+      --accent-a: #ff4d6d;
+      --accent-b: #ff8a00;
+      --accent-c: #ffd60a;
+      --accent-d: #c77dff;
+      --accent-e: #ff006e;
+      --accent-f: #fb5607;
     }
 
     * { box-sizing: border-box; }
@@ -28,8 +30,8 @@
       font-family: "Avenir Next", "Segoe UI", sans-serif;
       color: var(--text);
       background:
-        radial-gradient(1200px 600px at 10% -20%, rgba(79, 70, 229, 0.25), transparent 60%),
-        radial-gradient(900px 500px at 100% 0%, rgba(2, 132, 199, 0.25), transparent 55%),
+        radial-gradient(1200px 600px at 10% -20%, rgba(255, 77, 109, 0.2), transparent 60%),
+        radial-gradient(900px 500px at 100% 0%, rgba(199, 125, 255, 0.2), transparent 55%),
         linear-gradient(160deg, var(--bg-0), var(--bg-1));
       min-height: 100vh;
     }
@@ -254,11 +256,16 @@
       return `${v.toFixed(1)}%`;
     }
 
-    function cardColor(role, index) {
-      const palette = ["var(--accent-a)", "var(--accent-c)", "var(--accent-b)", "var(--accent-d)"];
-      if (role === "current") return "var(--accent-b)";
-      if (role === "target") return "var(--accent-c)";
-      return palette[index % palette.length];
+    function cardColor(role, index, buildId) {
+      const palette = ["var(--accent-a)", "var(--accent-b)", "var(--accent-c)", "var(--accent-d)", "var(--accent-e)", "var(--accent-f)"];
+      if (!buildId || typeof buildId !== "string") return palette[index % palette.length];
+      // Hash buildId to deterministic palette index
+      let hash = 0;
+      for (let i = 0; i < buildId.length; i++) {
+        hash = ((hash << 5) - hash) + buildId.charCodeAt(i);
+        hash = hash & hash; // Convert to 32bit integer
+      }
+      return palette[Math.abs(hash) % palette.length];
     }
 
     function shortBuildId(buildId) {
@@ -268,10 +275,10 @@
 
     function roleLabel(v) {
       const role = (v.role || "").toLowerCase();
-      if (role.includes("current") && role.includes("target")) return "current+target";
-      if (role.includes("target")) return "target";
-      if (role.includes("current")) return "current";
-      if (role.includes("deprecated")) return "deprecated";
+      if (role.includes("current") && role.includes("target")) return "incoming+active";
+      if (role.includes("target")) return "incoming";
+      if (role.includes("current")) return "active";
+      if (role.includes("deprecated")) return "draining";
       return role || "discovered";
     }
 
@@ -316,12 +323,17 @@
         statusEl.textContent = `Not Ready: ${data.ready?.reason || "Unknown"} - ${data.ready?.message || ""}`;
       }
 
+      const visibleVersions = (data.versions || []).filter((v) => {
+        const role = (v.role || "").toLowerCase();
+        return !role.includes("deprecated");
+      });
+
       versionsEl.innerHTML = "";
-      (data.versions || []).forEach((v, index) => {
+      visibleVersions.forEach((v, index) => {
         const row = document.createElement("div");
         row.className = "version-row";
 
-        const color = cardColor(v.role, index);
+        const color = cardColor(v.role, index, v.buildId);
         const versionLabel = shortBuildId(v.buildId);
         const role = roleLabel(v);
         const isDraining = v.draining === true;
