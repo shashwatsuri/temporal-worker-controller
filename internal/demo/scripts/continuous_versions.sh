@@ -5,7 +5,7 @@
 # Usage: sh continuous_versions.sh
 #
 # Environment:
-#   DELAY_SECONDS=180   seconds to wait after deploying before generating the next version
+#   DELAY_SECONDS=90    seconds to wait after deploying before generating the next version
 #   MAX_VERSIONS=0      stop after this many versions (0 = run forever)
 #   SKIP_DEPLOY=0       if 1, generate and commit but don't deploy (for testing)
 #   START_VERSION=1     starting version number
@@ -14,9 +14,9 @@ set -eu
 ROOT_DIR="$(git rev-parse --show-toplevel)"
 cd "$ROOT_DIR"
 
-# Progressive rollout uses 3x30s pauses, and gate workflows may take ~90s.
-# Use a conservative default so each target can promote and ramp before being superseded.
-DELAY_SECONDS="${DELAY_SECONDS:-180}"
+# Progressive rollout uses 3x30s pauses, and gate workflows may take 150-240s.
+# Intentionally use a shorter default so multiple pinned versions overlap.
+DELAY_SECONDS="${DELAY_SECONDS:-60}"
 MAX_VERSIONS="${MAX_VERSIONS:-0}"
 SKIP_DEPLOY="${SKIP_DEPLOY:-0}"
 START_VERSION="${START_VERSION:-1}"
@@ -27,9 +27,9 @@ if [ "$SKIP_DEPLOY" = "1" ]; then
   echo "[$(date '+%H:%M:%S')] SKIP_DEPLOY=1: will commit but not deploy"
 fi
 
-if [ "$SKIP_DEPLOY" != "1" ] && [ "$DELAY_SECONDS" -lt 120 ]; then
-  echo "[$(date '+%H:%M:%S')] ERROR: DELAY_SECONDS=${DELAY_SECONDS} is too low for progressive rollout"
-  echo "[$(date '+%H:%M:%S')] Use DELAY_SECONDS>=120 so targets can be promoted and ramped"
+if [ "$SKIP_DEPLOY" != "1" ] && [ "$DELAY_SECONDS" -lt 45 ]; then
+  echo "[$(date '+%H:%M:%S')] ERROR: DELAY_SECONDS=${DELAY_SECONDS} is too low for overlap mode"
+  echo "[$(date '+%H:%M:%S')] Use DELAY_SECONDS>=45 to avoid excessive rollout churn"
   exit 1
 fi
 

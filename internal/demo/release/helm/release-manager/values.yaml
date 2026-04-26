@@ -1,0 +1,41 @@
+manager:
+  image:
+    repository: rainbow-release-manager
+    tag: latest
+    pullPolicy: IfNotPresent
+
+job:
+  image:
+    repository: rainbow-release-job
+    tag: latest
+    pullPolicy: IfNotPresent
+
+temporal:
+  namespace: ""
+  address: ""
+  mtlsSecretName: ""
+  apiKey:
+    name: ""
+    key: ""
+
+schedule:
+  id: rainbow-release-schedule
+  cron: "*/2 * * * *"
+  paused: false
+  taskQueue: default/rainbow-release
+  workflowId: rainbow-release-run
+  catchupWindow: 1m
+  pauseOnFailure: true
+  workflowTimeout: 45m
+
+release:
+  name: helloworld
+  repoURL: https://github.com/temporalio/temporal-worker-controller
+  repoRef: main
+  worker: helloworld
+  jobServiceAccountName: rainbow-version-generator
+  stateConfigMapName: rainbow-version-state
+  awsRegion: us-east-2
+  awsRoleArn: ""
+  jobTTLSeconds: 300
+  jobTimeout: 40m

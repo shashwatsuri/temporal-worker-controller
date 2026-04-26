@@ -38,8 +38,8 @@ git show "${BASE_COMMIT}:${WORKER_FILE}" > "$WORKER_FILE"
 # --- Compute values that change per version ---
 # Keep sleep bounded so gate workflows (which execute HelloWorld) can complete
 # before the next version is generated.
-# 30s-60s sleep + up to 30s activity latency => <=90s per gate workflow.
-SLEEP_SECS=$(( 30 + (VERSION * 5) % 31 ))
+# 150s-240s sleep + up to 30s activity latency => <=270s per gate workflow.
+SLEEP_SECS=$(( 150 + (VERSION * 11) % 91 ))
 
 # Build the new worker.go with this version's changes using awk.
 # Always rewrites from the restored baseline, so patterns are stable.
@@ -61,9 +61,10 @@ awk -v ver="$VERSION" -v sleep_secs="$SLEEP_SECS" '
 
 mv "${WORKER_FILE}.tmp" "$WORKER_FILE"
 
-# Baseline commits may still have a short gate timeout; enforce a longer timeout
-# so rollout test workflows can complete before promotion is evaluated.
-sed -i.bak 's/WorkflowExecutionTimeout: time.Minute,/WorkflowExecutionTimeout: 12 * time.Minute,/' "$WORKER_FILE"
+# Keep RolloutGate timeouts long enough for overlap-focused demo rollouts.
+# Match both `time.Minute` and `N*time.Minute` forms to stay resilient to baseline changes.
+sed -E -i.bak 's/util\.SetActivityTimeout\(ctx, *([0-9]+\*)?time\.Minute\)/util.SetActivityTimeout(ctx, 12*time.Minute)/' "$WORKER_FILE"
+sed -E -i.bak 's/WorkflowExecutionTimeout: *([0-9]+\*)?time\.Minute/WorkflowExecutionTimeout: 12*time.Minute/' "$WORKER_FILE"
 rm -f "${WORKER_FILE}.bak"
 
 # Verify the change was applied
@@ -73,8 +74,14 @@ if ! grep -q "rainbow demo v$VERSION" "$WORKER_FILE"; then
   exit 1
 fi
 
-if ! grep -q "WorkflowExecutionTimeout: 12 \* time.Minute" "$WORKER_FILE"; then
+if ! grep -q "util.SetActivityTimeout(ctx, 12\*time.Minute)" "$WORKER_FILE"; then
   echo "[$TIMESTAMP] ERROR: Failed to enforce RolloutGate timeout"
+  git restore "$WORKER_FILE"
+  exit 1
+fi
+
+if ! grep -q "WorkflowExecutionTimeout: 12\*time.Minute" "$WORKER_FILE"; then
+  echo "[$TIMESTAMP] ERROR: Failed to enforce RolloutGate child workflow timeout"
   git restore "$WORKER_FILE"
   exit 1
 fi
@@ -93,6 +100,48 @@ if [ "$SKIP_DEPLOY" = "1" ]; then
 fi
 
 echo "[$TIMESTAMP] Deploying..."
-skaffold run --profile helloworld-worker
+
+# Detect EKS context and ensure we use an ECR repo for deploys.
+CURRENT_CONTEXT=$(kubectl config current-context 2>/dev/null || true)
+IS_EKS_CONTEXT=0
+case "$CURRENT_CONTEXT" in
+  arn:aws:eks:*) IS_EKS_CONTEXT=1 ;;
+esac
+
+DEPLOY_REPO="${SKAFFOLD_DEFAULT_REPO:-}"
+if [ "$IS_EKS_CONTEXT" = "1" ] && [ -z "$DEPLOY_REPO" ]; then
+  AWS_REGION=$(echo "$CURRENT_CONTEXT" | cut -d: -f4)
+  AWS_ACCOUNT_ID=$(echo "$CURRENT_CONTEXT" | cut -d: -f5)
+  DEPLOY_REPO="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+  echo "[$TIMESTAMP] EKS context detected; using derived ECR repo: $DEPLOY_REPO"
+fi
+
+if [ -n "$DEPLOY_REPO" ] && echo "$DEPLOY_REPO" | grep -q "dkr.ecr"; then
+  # EKS deployment: build multi-platform image manually (skaffold docker driver can't merge them)
+  COMMIT_SHA=$(git rev-parse HEAD)
+  IMAGE_TAG="${DEPLOY_REPO}/helloworld:${COMMIT_SHA}"
+  
+  echo "[$TIMESTAMP] Building multi-platform image for EKS: $IMAGE_TAG"
+  docker buildx build \
+    --platform linux/amd64,linux/arm64 \
+    --build-arg WORKER=helloworld \
+    --build-arg DD_GIT_COMMIT_SHA="$COMMIT_SHA" \
+    --build-arg DD_GIT_REPOSITORY_URL="github.com/temporalio/temporal-worker-controller" \
+    --tag "$IMAGE_TAG" \
+    --push \
+    -f internal/demo/Dockerfile \
+    internal/demo/
+  
+  echo "[$TIMESTAMP] Deploying with skaffold (no build)"
+  ARTIFACTS_FILE=$(mktemp)
+  echo "{\"builds\":[{\"imageName\":\"helloworld\",\"tag\":\"$IMAGE_TAG\"}]}" > "$ARTIFACTS_FILE"
+  SKAFFOLD_DEFAULT_REPO="$DEPLOY_REPO" \
+  skaffold deploy --profile helloworld-worker \
+    --build-artifacts "$ARTIFACTS_FILE"
+  rm -f "$ARTIFACTS_FILE"
+else
+  # Local deployment (Minikube): use skaffold run normally
+  skaffold run --profile helloworld-worker
+fi
 
 echo "[$TIMESTAMP] Version $VERSION deployed"

@@ -1,0 +1,16 @@
+FROM gcr.io/kaniko-project/executor:debug AS kaniko
+
+FROM alpine:3.20
+
+RUN apk add --no-cache ca-certificates curl docker-cli git jq kubectl aws-cli
+
+RUN curl -fsSL https://storage.googleapis.com/skaffold/releases/latest/skaffold-linux-amd64 -o /usr/local/bin/skaffold \
+	&& chmod +x /usr/local/bin/skaffold
+
+COPY --from=kaniko /kaniko /kaniko
+
+ENV PATH="/kaniko:${PATH}"
+
+WORKDIR /work
+
+ENTRYPOINT ["/bin/sh"]
