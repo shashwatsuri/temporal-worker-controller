@@ -76,6 +76,45 @@ profiles:
               temporal.apiKey.key: "{{ .TEMPORAL_API_KEY_SECRET_KEY }}"
             valuesFiles:
               - internal/demo/helloworld/helm/helloworld/values.yaml
+
+  # Build the rainbow dashboard container image
+  - name: dashboard
+    build:
+      artifacts:
+        - image: rainbow-dashboard
+          context: .
+          docker:
+            dockerfile: internal/demo/Dockerfile.dashboard
+
+  - name: rainbow-release
+    build:
+      artifacts:
+        - image: rainbow-release-manager
+          context: internal/demo
+          docker:
+            dockerfile: Dockerfile
+            buildArgs:
+              DD_GIT_COMMIT_SHA: "{{ .IMAGE_TAG }}"
+              DD_GIT_REPOSITORY_URL: "github.com/temporalio/temporal-worker-controller"
+              WORKER: "release"
+        - image: rainbow-release-job
+          context: .
+          docker:
+            dockerfile: internal/demo/Dockerfile.release-job
+    manifests:
+      helm:
+        releases:
+          - name: rainbow-release-manager
+            chartPath: internal/demo/release/helm/release-manager
+            setValueTemplates:
+              temporal.namespace: "{{ .TEMPORAL_NAMESPACE }}"
+              temporal.address: "{{ .TEMPORAL_ADDRESS }}"
+              temporal.mtlsSecretName: "{{ .TEMPORAL_MTLS_SECRET_NAME }}"
+              temporal.apiKey.name: "{{ .TEMPORAL_API_KEY_SECRET_NAME }}"
+              temporal.apiKey.key: "{{ .TEMPORAL_API_KEY_SECRET_KEY }}"
+            valuesFiles:
+              - internal/demo/release/helm/release-manager/values.yaml
+
 deploy:
   helm:
     hooks:

@@ -1,0 +1,211 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "release-manager.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "release-manager.labels" . | nindent 4 }}
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "release-manager.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "release-manager.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "release-manager.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "release-manager.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "release-manager.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "release-manager.fullname" . }}
+    namespace: {{ .Release.Namespace }}
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.release.jobServiceAccountName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "release-manager.labels" . | nindent 4 }}
+  {{- with .Values.release.awsRoleArn }}
+  annotations:
+    eks.amazonaws.com/role-arn: {{ . | quote }}
+  {{- end }}
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Values.release.jobServiceAccountName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "release-manager.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "patch", "create"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["temporal.io"]
+    resources: ["temporalworkerdeployments"]
+    verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Values.release.jobServiceAccountName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "release-manager.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Values.release.jobServiceAccountName }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.release.jobServiceAccountName }}
+    namespace: {{ .Release.Namespace }}
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.release.stateConfigMapName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "release-manager.labels" . | nindent 4 }}
+data:
+  current_version: "0"
+  last_image_tag: "none"
+  last_generated: "never"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "release-manager.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "release-manager.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "release-manager.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "release-manager.name" . }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      serviceAccountName: {{ include "release-manager.fullname" . }}
+      containers:
+        - name: manager
+          image: {{ .Values.manager.image.repository }}:{{ .Values.manager.image.tag }}
+          imagePullPolicy: {{ .Values.manager.image.pullPolicy }}
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+          env:
+            - name: TEMPORAL_ADDRESS
+              value: {{ .Values.temporal.address | quote }}
+            - name: TEMPORAL_NAMESPACE
+              value: {{ .Values.temporal.namespace | quote }}
+            - name: TEMPORAL_TASK_QUEUE
+              value: {{ .Values.schedule.taskQueue | quote }}
+            - name: RELEASE_SCHEDULE_ID
+              value: {{ .Values.schedule.id | quote }}
+            - name: RELEASE_SCHEDULE_CRON
+              value: {{ .Values.schedule.cron | quote }}
+            - name: RELEASE_SCHEDULE_PAUSED
+              value: {{ .Values.schedule.paused | quote }}
+            - name: RELEASE_WORKFLOW_ID
+              value: {{ .Values.schedule.workflowId | quote }}
+            - name: RELEASE_SCHEDULE_CATCHUP_WINDOW
+              value: {{ .Values.schedule.catchupWindow | quote }}
+            - name: RELEASE_SCHEDULE_PAUSE_ON_FAILURE
+              value: {{ .Values.schedule.pauseOnFailure | quote }}
+            - name: RELEASE_WORKFLOW_TIMEOUT
+              value: {{ .Values.schedule.workflowTimeout | quote }}
+            - name: RELEASE_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: RELEASE_NAME
+              value: {{ .Values.release.name | quote }}
+            - name: RELEASE_REPO_URL
+              value: {{ .Values.release.repoURL | quote }}
+            - name: RELEASE_REPO_REF
+              value: {{ .Values.release.repoRef | quote }}
+            - name: RELEASE_WORKER
+              value: {{ .Values.release.worker | quote }}
+            - name: RELEASE_JOB_IMAGE
+              value: {{ printf "%s:%s" .Values.job.image.repository .Values.job.image.tag | quote }}
+            - name: RELEASE_JOB_PULL_POLICY
+              value: {{ .Values.job.image.pullPolicy | quote }}
+            - name: RELEASE_JOB_SERVICE_ACCOUNT
+              value: {{ .Values.release.jobServiceAccountName | quote }}
+            - name: RELEASE_STATE_CONFIGMAP
+              value: {{ .Values.release.stateConfigMapName | quote }}
+            - name: RELEASE_AWS_REGION
+              value: {{ .Values.release.awsRegion | quote }}
+            - name: RELEASE_JOB_TTL_SECONDS
+              value: {{ .Values.release.jobTTLSeconds | quote }}
+            - name: RELEASE_JOB_TIMEOUT
+              value: {{ .Values.release.jobTimeout | quote }}
+          {{- if .Values.temporal.apiKey.name }}
+            - name: TEMPORAL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.temporal.apiKey.name | quote }}
+                  key: {{ .Values.temporal.apiKey.key | quote }}
+          {{- end }}
+          {{- if .Values.temporal.mtlsSecretName }}
+            - name: TEMPORAL_TLS
+              value: "true"
+            - name: TEMPORAL_TLS_CLIENT_CERT_PATH
+              value: /etc/temporal/tls/tls.crt
+            - name: TEMPORAL_TLS_CLIENT_KEY_PATH
+              value: /etc/temporal/tls/tls.key
+            - name: TEMPORAL_TLS_SERVER_CA_CERT_PATH
+              value: /etc/temporal/tls/ca.crt
+          {{- end }}
+          {{- if .Values.temporal.mtlsSecretName }}
+          volumeMounts:
+            - name: temporal-mtls
+              mountPath: /etc/temporal/tls
+              readOnly: true
+          {{- end }}
+      {{- if .Values.temporal.mtlsSecretName }}
+      volumes:
+        - name: temporal-mtls
+          secret:
+            secretName: {{ .Values.temporal.mtlsSecretName | quote }}
+      {{- end }}
