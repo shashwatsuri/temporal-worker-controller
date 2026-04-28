@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Deploys controller + helloworld + dashboard to the active EKS context.
 # Optional env vars:
-#   AWS_PROFILE=<profile>
+AWS_PROFILE="${AWS_PROFILE:-bitovi-temporal}"
 #   DASHBOARD_NAMESPACE=<namespace> (default: default)
 #   DASHBOARD_NAME=<worker name> (default: helloworld)
 #   EXPOSE_PUBLIC=true|false (default: false)
@@ -11,6 +11,9 @@ set -euo pipefail
 DASHBOARD_NAMESPACE="${DASHBOARD_NAMESPACE:-default}"
 DASHBOARD_NAME="${DASHBOARD_NAME:-helloworld}"
 EXPOSE_PUBLIC="${EXPOSE_PUBLIC:-false}"
+
+# Override if needed (for mixed-arch clusters or troubleshooting): linux/amd64 or linux/arm64
+TARGET_PLATFORM="${TARGET_PLATFORM:-}"
 
 CTX="$(kubectl config current-context)"
 if [[ ! "$CTX" =~ ^arn:aws:eks: ]]; then
@@ -30,6 +33,42 @@ if [[ -n "${AWS_PROFILE:-}" ]]; then
 fi
 
 echo "Using EKS cluster: ${CLUSTER_NAME} (${REGION})"
+
+# Default to the first node architecture so pushed images match what EKS can run.
+if [[ -z "$TARGET_PLATFORM" ]]; then
+  NODE_ARCH="$(kubectl get nodes -o jsonpath='{.items[0].status.nodeInfo.architecture}' 2>/dev/null || true)"
+  case "$NODE_ARCH" in
+    amd64)
+      TARGET_PLATFORM="linux/amd64"
+      ;;
+    arm64)
+      TARGET_PLATFORM="linux/arm64"
+      ;;
+    *)
+      TARGET_PLATFORM="linux/amd64"
+      echo "Warning: couldn't detect node architecture (got '$NODE_ARCH'); defaulting TARGET_PLATFORM=$TARGET_PLATFORM"
+      ;;
+  esac
+fi
+
+echo "Using image platform: ${TARGET_PLATFORM}"
+
+SKAFFOLD_ARCH_PROFILE=""
+case "$TARGET_PLATFORM" in
+  linux/amd64)
+    SKAFFOLD_ARCH_PROFILE="eks-amd64"
+    ;;
+  linux/arm64)
+    SKAFFOLD_ARCH_PROFILE="eks-arm64"
+    ;;
+  *)
+    echo "Unsupported TARGET_PLATFORM: $TARGET_PLATFORM"
+    echo "Expected linux/amd64 or linux/arm64"
+    exit 1
+    ;;
+esac
+
+echo "Using skaffold arch profile: ${SKAFFOLD_ARCH_PROFILE}"
 
 if ! "${AWS_CMD[@]}" sts get-caller-identity >/dev/null 2>&1; then
   echo "AWS credentials not available for this shell."
@@ -51,24 +90,29 @@ done
   docker login --username AWS --password-stdin "$ECR_BASE"
 
 echo "Deploying controller via skaffold profile worker-controller"
-SKAFFOLD_DEFAULT_REPO="$ECR_BASE" skaffold run --profile worker-controller
+SKAFFOLD_DEFAULT_REPO="$ECR_BASE" skaffold run \
+  --cache-artifacts=false \
+  --platform "$TARGET_PLATFORM" \
+  --profile "worker-controller,${SKAFFOLD_ARCH_PROFILE}"
 
 echo "Deploying demo worker via skaffold profile helloworld-worker"
-SKAFFOLD_DEFAULT_REPO="$ECR_BASE" skaffold run --profile helloworld-worker
+SKAFFOLD_DEFAULT_REPO="$ECR_BASE" skaffold run \
+  --cache-artifacts=false \
+  --platform "$TARGET_PLATFORM" \
+  --profile "helloworld-worker,${SKAFFOLD_ARCH_PROFILE}"
 
 echo "Building and pushing dashboard image"
-docker build -t "$ECR_BASE/rainbow-dashboard:latest" -f internal/demo/Dockerfile.dashboard .
-docker push "$ECR_BASE/rainbow-dashboard:latest"
+docker buildx build --platform "$TARGET_PLATFORM" -t "$ECR_BASE/rainbow-dashboard:latest" -f internal/demo/Dockerfile.dashboard . --push
 
 echo "Applying dashboard manifests"
+# Cleanup from older script behavior: remove literal NAMESPACE env so apply with valueFrom succeeds.
+kubectl -n "$DASHBOARD_NAMESPACE" set env deployment/rainbow-dashboard NAMESPACE- >/dev/null 2>&1 || true
 kubectl apply -f internal/demo/k8s/dashboard-deployment.yaml
 kubectl -n "$DASHBOARD_NAMESPACE" set image deployment/rainbow-dashboard \
   dashboard="$ECR_BASE/rainbow-dashboard:latest"
 kubectl -n "$DASHBOARD_NAMESPACE" patch deployment rainbow-dashboard --type strategic -p \
   '{"spec":{"template":{"spec":{"containers":[{"name":"dashboard","imagePullPolicy":"Always"}]}}}}'
-kubectl -n "$DASHBOARD_NAMESPACE" set env deployment/rainbow-dashboard \
-  NAMESPACE="$DASHBOARD_NAMESPACE"
-kubectl -n "$DASHBOARD_NAMESPACE" patch deployment rainbow-dashboard --type merge -p \
+kubectl -n "$DASHBOARD_NAMESPACE" patch deployment rainbow-dashboard --type strategic -p \
   "{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"dashboard\",\"args\":[\"--namespace\",\"$DASHBOARD_NAMESPACE\",\"--name\",\"$DASHBOARD_NAME\",\"--port\",\"8787\"]}]}}}}"
 
 if [[ "$EXPOSE_PUBLIC" == "true" ]]; then

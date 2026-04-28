@@ -30,8 +30,8 @@ schedule:
 
 release:
   name: helloworld
-  repoURL: https://github.com/temporalio/temporal-worker-controller
-  repoRef: main
+  repoURL: https://github.com/shashwatsuri/temporal-worker-controller
+  repoRef: rainbow-release-schedule-fix
   worker: helloworld
   jobServiceAccountName: rainbow-version-generator
   stateConfigMapName: rainbow-version-state

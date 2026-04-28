@@ -59,7 +59,7 @@ func loadConfig() release.Config {
 		WorkflowTimeout:   getEnvDuration("RELEASE_WORKFLOW_TIMEOUT", 45*time.Minute),
 		Namespace:         getEnv("RELEASE_NAMESPACE", "default"),
 		ReleaseName:       getEnv("RELEASE_NAME", "helloworld"),
-		RepoURL:           getEnv("RELEASE_REPO_URL", "https://github.com/temporalio/temporal-worker-controller"),
+			RepoURL:           getEnv("RELEASE_REPO_URL", "https://github.com/shashwatsuri/temporal-worker-controller"),
 		RepoRef:           getEnv("RELEASE_REPO_REF", "main"),
 		Worker:            getEnv("RELEASE_WORKER", "helloworld"),
 		JobImage:          mustGetEnv("RELEASE_JOB_IMAGE"),

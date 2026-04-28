@@ -51,10 +51,6 @@ profiles:
   # Build and deploy the helloworld Custom Resource to the local k8s cluster  
   - name: helloworld-worker
     build:
-      local:
-        push: false
-      platforms:
-        - linux/arm64
       artifacts:
         - image: helloworld
           context: internal/demo
@@ -99,7 +95,7 @@ profiles:
             dockerfile: Dockerfile
             buildArgs:
               DD_GIT_COMMIT_SHA: "{{ .IMAGE_TAG }}"
-              DD_GIT_REPOSITORY_URL: "github.com/temporalio/temporal-worker-controller"
+              DD_GIT_REPOSITORY_URL: "github.com/shashwatsuri/temporal-worker-controller"
               WORKER: "release"
         - image: rainbow-release-job
           context: .
@@ -122,6 +118,20 @@ profiles:
               temporal.apiKey.key: "{{ .TEMPORAL_API_KEY_SECRET_KEY }}"
             valuesFiles:
               - internal/demo/release/helm/release-manager/values.yaml
+
+  # Architecture override profile for EKS/x86_64 clusters.
+  # Use in combination with another profile, e.g. --profile worker-controller,eks-amd64
+  - name: eks-amd64
+    build:
+      platforms:
+        - linux/amd64
+
+  # Architecture override profile for EKS/arm64 clusters.
+  # Use in combination with another profile, e.g. --profile worker-controller,eks-arm64
+  - name: eks-arm64
+    build:
+      platforms:
+        - linux/arm64
 
 deploy:
   helm:

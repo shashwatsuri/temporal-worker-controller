@@ -143,6 +143,9 @@ metadata:
 spec:
   # Schedule: every 2 minutes
   schedule: "*/2 * * * *"
+
+  # Keep legacy CronJob disabled when Temporal schedule is the active trigger.
+  suspend: true
   
   # Concurrency control: prevent overlapping runs
   concurrencyPolicy: Forbid
