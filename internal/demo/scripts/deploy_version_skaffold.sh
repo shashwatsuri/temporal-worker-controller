@@ -11,6 +11,8 @@
 #   SKAFFOLD_DEFAULT_REPO  ECR repository (auto-detected from IMAGE_TAG if not set)
 #   SKAFFOLD_PROFILE       Skaffold profile to use (default: helloworld-worker)
 #   DRY_RUN                Set to 1 to preview deployment without applying
+#   WAIT_FOR_TWD_ROLLOUT   Set to 1 to block until TWD status is Succeeded (default: 0)
+#   ROLLOUT_TIMEOUT_SECONDS Timeout when WAIT_FOR_TWD_ROLLOUT=1 (default: 300)
 #
 # This script:
 # 1. Extracts ECR repo from IMAGE_TAG
@@ -28,6 +30,8 @@ NAMESPACE="${2:-default}"
 RELEASE_NAME="${3:-helloworld}"
 SKAFFOLD_PROFILE="${SKAFFOLD_PROFILE:-helloworld-worker}"
 DRY_RUN="${DRY_RUN:-0}"
+WAIT_FOR_TWD_ROLLOUT="${WAIT_FOR_TWD_ROLLOUT:-0}"
+ROLLOUT_TIMEOUT_SECONDS="${ROLLOUT_TIMEOUT_SECONDS:-300}"
 
 if [ -z "$IMAGE_TAG" ]; then
   echo "[$TIMESTAMP] ERROR: IMAGE_TAG required"
@@ -120,37 +124,45 @@ rm -f "$ARTIFACTS_FILE"
 
 echo "[$TIMESTAMP] Skaffold deploy completed"
 
-# 6. Wait for TemporalWorkerDeployment rollout (if applicable)
-echo "[$TIMESTAMP] Waiting for TemporalWorkerDeployment/$RELEASE_NAME to rollout..."
+# 6. Optionally wait for TemporalWorkerDeployment rollout.
+# For schedule-driven rainbow releases we default to non-blocking mode so
+# new versions keep getting deployed even while older versions are still
+# draining active workflows.
+if [ "$WAIT_FOR_TWD_ROLLOUT" = "1" ]; then
+  echo "[$TIMESTAMP] Waiting for TemporalWorkerDeployment/$RELEASE_NAME to rollout..."
 
-ROLLOUT_TIMEOUT=300  # 5 minutes
-POLL_INTERVAL=5
-ELAPSED=0
+  ROLLOUT_TIMEOUT="$ROLLOUT_TIMEOUT_SECONDS"
+  POLL_INTERVAL=5
+  ELAPSED=0
 
-while [ $ELAPSED -lt $ROLLOUT_TIMEOUT ]; do
-  # Check if TWD exists and is ready
-  TWD_STATUS=$(kubectl get temporalworkerdeployment "$RELEASE_NAME" -n "$NAMESPACE" -o json 2>/dev/null | jq -r '.status.phase // "Unknown"' 2>/dev/null || echo "Unknown")
-  
-  if [ "$TWD_STATUS" = "Succeeded" ]; then
-    echo "[$TIMESTAMP] TemporalWorkerDeployment ready (status: $TWD_STATUS)"
-    break
-  elif [ "$TWD_STATUS" = "Failed" ] || [ "$TWD_STATUS" = "Error" ]; then
-    echo "[$TIMESTAMP] ERROR: TemporalWorkerDeployment failed (status: $TWD_STATUS)"
-    kubectl get temporalworkerdeployment "$RELEASE_NAME" -n "$NAMESPACE" -o yaml | head -100
-    exit 1
+  while [ $ELAPSED -lt $ROLLOUT_TIMEOUT ]; do
+    # Check if TWD exists and is ready
+    TWD_STATUS=$(kubectl get temporalworkerdeployment "$RELEASE_NAME" -n "$NAMESPACE" -o json 2>/dev/null | jq -r '.status.phase // "Unknown"' 2>/dev/null || echo "Unknown")
+
+    if [ "$TWD_STATUS" = "Succeeded" ]; then
+      echo "[$TIMESTAMP] TemporalWorkerDeployment ready (status: $TWD_STATUS)"
+      break
+    elif [ "$TWD_STATUS" = "Failed" ] || [ "$TWD_STATUS" = "Error" ]; then
+      echo "[$TIMESTAMP] ERROR: TemporalWorkerDeployment failed (status: $TWD_STATUS)"
+      kubectl get temporalworkerdeployment "$RELEASE_NAME" -n "$NAMESPACE" -o yaml | head -100
+      exit 1
+    fi
+
+    echo "[$TIMESTAMP] Waiting for rollout... (status: $TWD_STATUS, elapsed: ${ELAPSED}s/${ROLLOUT_TIMEOUT}s)"
+    sleep $POLL_INTERVAL
+    ELAPSED=$((ELAPSED + POLL_INTERVAL))
+  done
+
+  if [ $ELAPSED -ge $ROLLOUT_TIMEOUT ]; then
+    echo "[$TIMESTAMP] WARNING: Rollout did not complete within ${ROLLOUT_TIMEOUT}s"
+    echo "[$TIMESTAMP] Current status:"
+    kubectl get temporalworkerdeployment "$RELEASE_NAME" -n "$NAMESPACE" -o yaml 2>/dev/null | head -50 || true
+  else
+    echo "[$TIMESTAMP] Rollout successful"
   fi
-  
-  echo "[$TIMESTAMP] Waiting for rollout... (status: $TWD_STATUS, elapsed: ${ELAPSED}s/${ROLLOUT_TIMEOUT}s)"
-  sleep $POLL_INTERVAL
-  ELAPSED=$((ELAPSED + POLL_INTERVAL))
-done
-
-if [ $ELAPSED -ge $ROLLOUT_TIMEOUT ]; then
-  echo "[$TIMESTAMP] WARNING: Rollout did not complete within ${ROLLOUT_TIMEOUT}s"
-  echo "[$TIMESTAMP] Current status:"
-  kubectl get temporalworkerdeployment "$RELEASE_NAME" -n "$NAMESPACE" -o yaml 2>/dev/null | head -50 || true
 else
-  echo "[$TIMESTAMP] Rollout successful"
+  TWD_STATUS=$(kubectl get temporalworkerdeployment "$RELEASE_NAME" -n "$NAMESPACE" -o json 2>/dev/null | jq -r '.status.phase // "Unknown"' 2>/dev/null || echo "Unknown")
+  echo "[$TIMESTAMP] Non-blocking mode: submitted rollout for TemporalWorkerDeployment/$RELEASE_NAME (status now: $TWD_STATUS)"
 fi
 
 # 7. Verify image was deployed

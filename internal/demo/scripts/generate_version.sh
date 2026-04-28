@@ -116,7 +116,12 @@ if [ "$IS_EKS_CONTEXT" = "1" ] && [ -z "$DEPLOY_REPO" ]; then
   echo "[$TIMESTAMP] EKS context detected; using derived ECR repo: $DEPLOY_REPO"
 fi
 
-if [ -n "$DEPLOY_REPO" ] && echo "$DEPLOY_REPO" | grep -q "dkr.ecr"; then
+if [ "$IS_EKS_CONTEXT" != "1" ] && [ -n "$DEPLOY_REPO" ]; then
+  echo "[$TIMESTAMP] Non-EKS context detected; ignoring SKAFFOLD_DEFAULT_REPO=$DEPLOY_REPO for local deploy"
+  DEPLOY_REPO=""
+fi
+
+if [ "$IS_EKS_CONTEXT" = "1" ] && [ -n "$DEPLOY_REPO" ] && echo "$DEPLOY_REPO" | grep -q "dkr.ecr"; then
   # EKS deployment: build multi-platform image manually (skaffold docker driver can't merge them)
   COMMIT_SHA=$(git rev-parse HEAD)
   IMAGE_TAG="${DEPLOY_REPO}/helloworld:${COMMIT_SHA}"
@@ -136,12 +141,22 @@ if [ -n "$DEPLOY_REPO" ] && echo "$DEPLOY_REPO" | grep -q "dkr.ecr"; then
   ARTIFACTS_FILE=$(mktemp)
   echo "{\"builds\":[{\"imageName\":\"helloworld\",\"tag\":\"$IMAGE_TAG\"}]}" > "$ARTIFACTS_FILE"
   SKAFFOLD_DEFAULT_REPO="$DEPLOY_REPO" \
-  skaffold deploy --profile helloworld-worker \
+  skaffold deploy --kube-context "$CURRENT_CONTEXT" --profile helloworld-worker \
     --build-artifacts "$ARTIFACTS_FILE"
   rm -f "$ARTIFACTS_FILE"
 else
-  # Local deployment (Minikube): use skaffold run normally
-  skaffold run --profile helloworld-worker
+  # Local deployment defaults to minikube unless overridden.
+  LOCAL_KUBE_CONTEXT="${LOCAL_KUBE_CONTEXT:-minikube}"
+  if ! kubectl config get-contexts -o name | grep -qx "$LOCAL_KUBE_CONTEXT"; then
+    echo "[$TIMESTAMP] ERROR: Local kube context '$LOCAL_KUBE_CONTEXT' not found"
+    echo "[$TIMESTAMP] Set LOCAL_KUBE_CONTEXT to an existing local cluster context"
+    exit 1
+  fi
+  echo "[$TIMESTAMP] Local deploy context: $LOCAL_KUBE_CONTEXT"
+
+  # Local deployment (Minikube): build/load image directly into local cluster runtime.
+  unset SKAFFOLD_DEFAULT_REPO || true
+  skaffold run --kube-context "$LOCAL_KUBE_CONTEXT" --profile helloworld-worker
 fi
 
 echo "[$TIMESTAMP] Version $VERSION deployed"

@@ -1,0 +1,285 @@
+---
+# ServiceAccount for the rainbow version generator CronJob
+# IRSA annotation enables the pod to assume AWS IAM role for ECR access
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rainbow-version-generator
+  namespace: default
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::025066239481:role/rainbow-version-generator-role
+
+---
+# ClusterRole for rainbow version generator
+# Permissions needed: access to ConfigMaps, create Jobs, read deployments, manage TemporalWorkerDeployments
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: rainbow-version-generator
+rules:
+  # ConfigMap permissions for version state management
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "patch", "create"]
+  
+  # Read deployments and pods for debugging
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/logs"]
+    verbs: ["get", "list", "watch"]
+  
+  # Manage TemporalWorkerDeployments (read/watch for deployment verification)
+  - apiGroups: ["temporal.io"]
+    resources: ["temporalworkerdeployments"]
+    verbs: ["get", "list", "watch"]
+
+---
+# ClusterRoleBinding for rainbow version generator
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: rainbow-version-generator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: rainbow-version-generator
+subjects:
+  - kind: ServiceAccount
+    name: rainbow-version-generator
+    namespace: default
+
+---
+# ConfigMap to store version generation scripts
+# These scripts are used by the CronJob to generate and deploy new versions
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rainbow-version-scripts
+  namespace: default
+data:
+  generate_version_cron.sh: |
+    #!/bin/sh
+    # [Content will be synchronized from /internal/demo/scripts/generate_version_cron.sh]
+    # This is a placeholder; inject actual content during deployment
+  
+  build_version_kaniko.sh: |
+    #!/bin/sh
+    # [Content will be synchronized from /internal/demo/scripts/build_version_kaniko.sh]
+    # This is a placeholder; inject actual content during deployment
+  
+  deploy_version_skaffold.sh: |
+    #!/bin/sh
+    # [Content will be synchronized from /internal/demo/scripts/deploy_version_skaffold.sh]
+    # This is a placeholder; inject actual content during deployment
+  
+  orchestrate.sh: |
+    #!/bin/sh
+    set -eu
+    TIMESTAMP=$(date '+%H:%M:%S')
+    echo "[$TIMESTAMP] Starting rainbow version generation orchestration"
+    
+    # Configuration from environment
+    NAMESPACE="${NAMESPACE:-default}"
+    RELEASE_NAME="${RELEASE_NAME:-helloworld}"
+    REPO_URL="${REPO_URL:-https://github.com/temporalio/temporal-worker-controller}"
+    REPO_REF="${REPO_REF:-main}"
+    
+    # Ensure we're in a temp working directory
+    WORK_DIR=$(mktemp -d)
+    cd "$WORK_DIR"
+    trap "rm -rf $WORK_DIR" EXIT
+    
+    echo "[$TIMESTAMP] Working directory: $WORK_DIR"
+    
+    # 1. Clone repository (fresh checkout to ensure baseline)
+    echo "[$TIMESTAMP] Cloning repository..."
+    git clone --depth 1 --branch "$REPO_REF" "$REPO_URL" repo
+    cd repo
+    
+    # 2. Run version generation script
+    echo "[$TIMESTAMP] Phase 1: Generating version..."
+    IMAGE_TAG=$(sh internal/demo/scripts/generate_version_cron.sh | tail -n 1)
+    if [ -z "$IMAGE_TAG" ]; then
+      echo "[$TIMESTAMP] ERROR: Failed to generate IMAGE_TAG"
+      exit 1
+    fi
+    
+    echo "[$TIMESTAMP] Generated IMAGE_TAG: $IMAGE_TAG"
+    
+    # 3. Run build script (Kaniko-based multi-arch build)
+    echo "[$TIMESTAMP] Phase 2: Building image..."
+    export DD_GIT_COMMIT_SHA=$(git rev-parse HEAD)
+    export DD_GIT_REPOSITORY_URL="$REPO_URL"
+    sh internal/demo/scripts/build_version_kaniko.sh "$IMAGE_TAG"
+    
+    # 4. Run deploy script
+    echo "[$TIMESTAMP] Phase 3: Deploying version..."
+    sh internal/demo/scripts/deploy_version_skaffold.sh "$IMAGE_TAG" "$NAMESPACE" "$RELEASE_NAME"
+    
+    echo "[$TIMESTAMP] Orchestration complete"
+
+---
+# ConfigMap to store rainbow version state (current version counter)
+# This is used by the version generation script to track version numbers
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rainbow-version-state
+  namespace: default
+data:
+  current_version: "0"
+  last_image_tag: "none"
+  last_generated: "never"
+
+---
+# CronJob to generate new rainbow worker versions on a schedule
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: rainbow-version-generator
+  namespace: default
+spec:
+  # Schedule: every 2 minutes
+  schedule: "*/2 * * * *"
+  
+  # Concurrency control: prevent overlapping runs
+  concurrencyPolicy: Forbid
+  
+  # Job history limits for debugging and cleanup
+  successfulJobsHistoryLimit: 5
+  failedJobsHistoryLimit: 3
+  
+  # Starting deadline: job must start within 1 minute of scheduled time
+  startingDeadlineSeconds: 60
+  
+  jobTemplate:
+    spec:
+      # TTL for cleanup after job completion
+      ttlSecondsAfterFinished: 300
+      
+      # Backoff limit for retries
+      backoffLimit: 1
+      
+      template:
+        metadata:
+          labels:
+            app: rainbow-version-generator
+        spec:
+          serviceAccountName: rainbow-version-generator
+          restartPolicy: Never
+          
+          # Init containers: set up environment
+          initContainers:
+            # Initialize working directory with required scripts
+            - name: setup
+              image: alpine:3.18
+              command:
+                - sh
+                - -c
+                - |
+                  set -eu
+                  echo "Preparing environment..."
+                  mkdir -p /work/scripts
+                  cp /scripts/* /work/scripts/
+                  chmod 755 /work/scripts/*
+                  echo "Setup complete"
+              volumeMounts:
+                - name: scripts
+                  mountPath: /scripts
+                - name: work
+                  mountPath: /work
+          
+          # Main container: orchestrate version generation
+          containers:
+            - name: orchestrator
+              # Use alpine with apk to install required tools: git, kubectl, aws cli, docker, jq
+              image: alpine:3.18
+              
+              # Override entrypoint to run orchestration script
+              command:
+                - /bin/sh
+              args:
+                - -c
+                - |
+                  set -eu
+                  TEMPORAL_CLI_VERSION="1.6.2"
+                  echo "Installing dependencies..."
+                  apk add --no-cache git kubectl aws-cli jq docker curl
+                  ARCH="$(uname -m)"
+                  case "$ARCH" in
+                    x86_64) TEMPORAL_ARCH="amd64" ;;
+                    aarch64) TEMPORAL_ARCH="arm64" ;;
+                    *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
+                  esac
+                  curl -fsSL "https://github.com/temporalio/cli/releases/download/v${TEMPORAL_CLI_VERSION}/temporal_cli_${TEMPORAL_CLI_VERSION}_linux_${TEMPORAL_ARCH}.tar.gz" -o /tmp/temporal.tar.gz
+                  tar -xzf /tmp/temporal.tar.gz -C /usr/local/bin temporal
+                  rm -f /tmp/temporal.tar.gz
+                  temporal --version
+                  
+                  echo "Running orchestration..."
+                  /work/scripts/orchestrate.sh
+              
+              env:
+                # Configuration
+                - name: NAMESPACE
+                  value: default
+                - name: RELEASE_NAME
+                  value: helloworld
+                - name: REPO_URL
+                  value: https://github.com/temporalio/temporal-worker-controller
+                - name: REPO_REF
+                  value: main
+                - name: WORKER
+                  value: helloworld
+                
+                # AWS configuration for IRSA
+                - name: AWS_ROLE_ARN
+                  value: arn:aws:iam::025066239481:role/rainbow-version-generator-role
+                - name: AWS_WEB_IDENTITY_TOKEN_FILE
+                  value: /var/run/secrets/eks.amazonaws.com/serviceaccount/token
+                - name: AWS_REGION
+                  value: us-east-2
+                
+                # Kubernetes config
+                - name: KUBECONFIG
+                  value: /var/run/secrets/kubernetes.io/serviceaccount/kubeconfig
+              
+              volumeMounts:
+                - name: scripts
+                  mountPath: /scripts
+                - name: work
+                  mountPath: /work
+                - name: tmp
+                  mountPath: /tmp
+              
+              # Resource limits
+              resources:
+                requests:
+                  cpu: 500m
+                  memory: 512Mi
+                limits:
+                  cpu: 2000m
+                  memory: 2Gi
+              
+              # Security context
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: false
+          
+          # Volumes
+          volumes:
+            # Mount scripts ConfigMap
+            - name: scripts
+              configMap:
+                name: rainbow-version-scripts
+                defaultMode: 0755
+            
+            # Shared working directory
+            - name: work
+              emptyDir: {}
+            
+            # Temp directory
+            - name: tmp
+              emptyDir: {}

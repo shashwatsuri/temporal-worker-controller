@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"context"
 	"embed"
 	"encoding/json"
@@ -11,10 +12,12 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -26,6 +29,14 @@ type twdResource struct {
 		Name      string `json:"name"`
 		Namespace string `json:"namespace"`
 	} `json:"metadata"`
+	Spec struct {
+		WorkerOptions struct {
+			ConnectionRef struct {
+				Name string `json:"name"`
+			} `json:"connectionRef"`
+			TemporalNamespace string `json:"temporalNamespace"`
+		} `json:"workerOptions"`
+	} `json:"spec"`
 	Status struct {
 		TargetVersion     versionRef      `json:"targetVersion"`
 		CurrentVersion    *versionRef     `json:"currentVersion,omitempty"`
@@ -74,6 +85,34 @@ type deploymentListResource struct {
 	Items []deploymentResource `json:"items"`
 }
 
+type temporalConnectionResource struct {
+	Spec struct {
+		HostPort           string `json:"hostPort"`
+		APIKeySecretRef    *struct {
+			Name string `json:"name"`
+			Key  string `json:"key"`
+		} `json:"apiKeySecretRef,omitempty"`
+		MutualTLSSecretRef *struct {
+			Name string `json:"name"`
+		} `json:"mutualTLSSecretRef,omitempty"`
+	} `json:"spec"`
+}
+
+type secretResource struct {
+	Data map[string]string `json:"data"`
+}
+
+type temporalAccessConfig struct {
+	Address        string
+	Namespace      string
+	APIKey         string
+	UseTLS         bool
+	TLSCertPath    string
+	TLSKeyPath     string
+	TempFiles      []string
+	SupportsCounts bool
+}
+
 type versionCard struct {
 	BuildID         string   `json:"buildId"`
 	Role            string   `json:"role"`
@@ -84,6 +123,8 @@ type versionCard struct {
 	TrafficPct      *float64 `json:"trafficPct,omitempty"`
 	// Draining is true for deprecated versions that are still serving pinned workflows.
 	Draining        bool     `json:"draining"`
+	ActiveWorkflowCount int  `json:"activeWorkflowCount,omitempty"`
+	ActiveWorkflowPct   *float64 `json:"activeWorkflowPct,omitempty"`
 	Deployment      string   `json:"deployment,omitempty"`
 	Replicas        int      `json:"replicas"`
 	ReadyReplicas   int      `json:"readyReplicas"`
@@ -95,11 +136,13 @@ type apiState struct {
 	FetchedAt            time.Time     `json:"fetchedAt"`
 	VersionCount         int           `json:"versionCount"`
 	ActiveVersions       int           `json:"activeVersions"`
+	ActiveWorkflowTotal  int           `json:"activeWorkflowTotal,omitempty"`
 	PinnedLikely         bool          `json:"pinnedLikely"`
 	SlotsUsed            *float64      `json:"slotsUsed,omitempty"`
 	SlotsCapacity        *float64      `json:"slotsCapacity,omitempty"`
 	SlotUtilizationPct   *float64      `json:"slotUtilizationPct,omitempty"`
 	MetricsNote          string        `json:"metricsNote,omitempty"`
+	ActiveWorkflowNote   string        `json:"activeWorkflowNote,omitempty"`
 	Progressing          *condition    `json:"progressing,omitempty"`
 	Ready                *condition    `json:"ready,omitempty"`
 	TemporalConnection   *condition    `json:"temporalConnection,omitempty"`
@@ -117,6 +160,33 @@ type promQueryResponse struct {
 	} `json:"data"`
 }
 
+type activeWorkflowCache struct {
+	mu      sync.RWMutex
+	total   int
+	counts  map[string]int
+	updated time.Time
+}
+
+var workflowCache activeWorkflowCache
+
+type slotMetricsCache struct {
+	mu      sync.RWMutex
+	used    float64
+	cap     float64
+	updated time.Time
+	hasData bool
+}
+
+var slotsCache slotMetricsCache
+
+type temporalAccessConfigCache struct {
+	mu      sync.RWMutex
+	cfg     temporalAccessConfig
+	updated time.Time
+}
+
+var configCache temporalAccessConfigCache
+
 func main() {
 	var (
 		namespace = flag.String("namespace", "default", "Kubernetes namespace for the TemporalWorkerDeployment")
@@ -132,7 +202,9 @@ func main() {
 	}
 	mux.Handle("/", http.FileServer(http.FS(staticSub)))
 	mux.HandleFunc("/api/state", func(w http.ResponseWriter, r *http.Request) {
-		ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+		// Use longer timeout to accommodate Temporal CLI calls which can take time on EKS
+		// Each individual command gets 15-20 sec timeout, so 75 sec total allows for 3-4 commands
+		ctx, cancel := context.WithTimeout(r.Context(), 75*time.Second)
 		defer cancel()
 
 		state, err := collectState(ctx, *namespace, *name)
@@ -241,7 +313,7 @@ func collectState(ctx context.Context, namespace, name string) (apiState, error)
 	pinnedLikely := false
 	for _, c := range cards {
 		s := strings.ToLower(c.Status)
-		if s == "current" || s == "ramping" || s == "draining" || s == "inactive" {
+		if c.BuildID != "" && (s == "current" || s == "ramping" || s == "draining") {
 			activeByBuildID[c.BuildID] = struct{}{}
 		}
 		if s == "draining" {
@@ -258,24 +330,73 @@ func collectState(ctx context.Context, namespace, name string) (apiState, error)
 		Versions:       cards,
 	}
 
+	if workflowTotal, workflowNote := enrichActiveWorkflowData(ctx, twd, cards); workflowTotal > 0 || workflowNote != "" {
+		state.ActiveWorkflowTotal = workflowTotal
+		if workflowNote != "" {
+			state.ActiveWorkflowNote = workflowNote
+		}
+	}
+
+	// Hide fully drained/deprecated versions from the API payload once active
+	// workflow data is available and indicates zero remaining workload.
+	if state.ActiveWorkflowTotal > 0 {
+		filtered := make([]versionCard, 0, len(cards))
+		for _, c := range cards {
+			status := strings.ToLower(c.Status)
+			role := strings.ToLower(c.Role)
+			isDeprecatedLike := strings.Contains(role, "deprecated") || status == "inactive" || status == "drained" || status == "draining"
+			pct := 0.0
+			if c.ActiveWorkflowPct != nil {
+				pct = *c.ActiveWorkflowPct
+			}
+			if isDeprecatedLike && c.ActiveWorkflowCount <= 0 && pct <= 0 {
+				continue
+			}
+			filtered = append(filtered, c)
+		}
+		cards = filtered
+		state.Versions = cards
+	}
+
 	taskQueue := fmt.Sprintf("%s/%s", namespace, name)
 	usedExpr := fmt.Sprintf(`sum(temporal_worker_task_slots_used{task_queue=%q})`, taskQueue)
 	capExpr := fmt.Sprintf(`sum(temporal_worker_task_slots_used{task_queue=%q} + temporal_worker_task_slots_available{task_queue=%q})`, taskQueue, taskQueue)
 
-	used, usedErr := queryPrometheusScalar(ctx, usedExpr)
-	cap, capErr := queryPrometheusScalar(ctx, capExpr)
+	usedCtx, cancelUsed := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	used, usedErr := queryPrometheusScalar(usedCtx, usedExpr)
+	cancelUsed()
+
+	capCtx, cancelCap := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	cap, capErr := queryPrometheusScalar(capCtx, capExpr)
+	cancelCap()
+	if usedErr == nil && capErr == nil && used != nil && cap != nil {
+		writeCachedSlotMetrics(*used, *cap)
+	}
 	if used != nil {
 		state.SlotsUsed = used
 	}
 	if cap != nil {
 		state.SlotsCapacity = cap
 	}
-	if used != nil && cap != nil && *cap > 0 {
-		utilPct := (*used / *cap) * 100
-		state.SlotUtilizationPct = &utilPct
-	}
 	if usedErr != nil || capErr != nil {
-		state.MetricsNote = "Prometheus metrics unavailable yet (verify monitoring stack and scrape targets)."
+		if cachedUsed, cachedCap, ok := readCachedSlotMetrics(); ok {
+			if state.SlotsUsed == nil {
+				state.SlotsUsed = cachedUsed
+			}
+			if state.SlotsCapacity == nil {
+				state.SlotsCapacity = cachedCap
+			}
+			state.MetricsNote = "Using recent cached Prometheus metrics while live query retries."
+		} else {
+			state.MetricsNote = "Prometheus metrics temporarily unavailable."
+		}
+	}
+	if state.SlotsUsed != nil && state.SlotsCapacity != nil {
+		utilPct := 0.0
+		if *state.SlotsCapacity > 0 {
+			utilPct = (*state.SlotsUsed / *state.SlotsCapacity) * 100
+		}
+		state.SlotUtilizationPct = &utilPct
 	}
 
 	for _, c := range twd.Status.Conditions {
@@ -293,6 +414,183 @@ func collectState(ctx context.Context, namespace, name string) (apiState, error)
 	}
 
 	return state, nil
+}
+
+func enrichActiveWorkflowData(ctx context.Context, twd twdResource, cards []versionCard) (int, string) {
+	cfg, err := loadTemporalAccessConfig(ctx, twd)
+	if err != nil {
+		log.Printf("dashboard: failed to load temporal access config: %v", err)
+		if total, ok := applyCachedWorkflowData(cards); ok {
+			return total, "Using recent cached active workflow percentages while live query retries."
+		}
+		return 0, ""
+	}
+	defer cleanupTempFiles(cfg.TempFiles)
+
+	deploymentKey := fmt.Sprintf("%s/%s", twd.Metadata.Namespace, twd.Metadata.Name)
+	totalQuery := fmt.Sprintf(`ExecutionStatus="Running" AND TemporalWorkerDeployment=%q`, deploymentKey)
+	total, err := temporalWorkflowCount(ctx, cfg, totalQuery)
+	if err != nil {
+		log.Printf("dashboard: failed to query total active workflows for %s: %v", deploymentKey, err)
+		if cachedTotal, ok := applyCachedWorkflowData(cards); ok {
+			return cachedTotal, "Using recent cached active workflow percentages while live query retries."
+		}
+		return 0, ""
+	}
+	if total == 0 {
+		// Avoid immediately dropping cache on transient zero-count reads.
+		if cachedTotal, ok := applyCachedWorkflowData(cards); ok {
+			return cachedTotal, "Using recent cached active workflow percentages while live query retries."
+		}
+		return 0, ""
+	}
+
+	notes := make([]string, 0, 1)
+	queriedCounts := make(map[string]int, len(cards))
+	attemptedCounts := 0
+
+	for i := range cards {
+		if cards[i].BuildID == "" {
+			continue
+		}
+		if !shouldQueryActiveWorkflowCount(cards[i]) {
+			continue
+		}
+		attemptedCounts++
+		versionKey := fmt.Sprintf("%s:%s", deploymentKey, cards[i].BuildID)
+		query := fmt.Sprintf(`ExecutionStatus="Running" AND TemporalWorkerDeploymentVersion=%q`, versionKey)
+		count, err := temporalWorkflowCount(ctx, cfg, query)
+		if err != nil {
+			log.Printf("dashboard: failed to query active workflows for version %s: %v", cards[i].BuildID[:min(12, len(cards[i].BuildID))], err)
+			notes = append(notes, "some active workflow percentages unavailable")
+			continue
+		}
+		queriedCounts[cards[i].BuildID] = count
+		cards[i].ActiveWorkflowCount = count
+		pct := (float64(count) / float64(total)) * 100
+		cards[i].ActiveWorkflowPct = &pct
+	}
+
+	// Cache the latest known total even if per-version counts are partial.
+	writeCachedWorkflowData(total, queriedCounts)
+
+	if attemptedCounts > 0 && len(queriedCounts) != attemptedCounts {
+		log.Printf("dashboard: partial workflow count results: %d/%d versions succeeded", len(queriedCounts), attemptedCounts)
+		applyPartialCachedWorkflowData(cards, total)
+	}
+
+	if len(notes) > 0 {
+		return total, notes[0]
+	}
+	return total, ""
+}
+
+// min returns the minimum of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func shouldQueryActiveWorkflowCount(card versionCard) bool {
+	status := strings.ToLower(card.Status)
+	role := strings.ToLower(card.Role)
+
+	if strings.Contains(role, "current") || strings.Contains(role, "target") {
+		return true
+	}
+	if status == "ramping" || status == "draining" || status == "current" {
+		return true
+	}
+	if card.ReadyReplicas > 0 {
+		return true
+	}
+	return false
+}
+
+func applyCachedWorkflowData(cards []versionCard) (int, bool) {
+	workflowCache.mu.RLock()
+	defer workflowCache.mu.RUnlock()
+	if workflowCache.total <= 0 {
+		return 0, false
+	}
+	if time.Since(workflowCache.updated) > 2*time.Minute {
+		return 0, false
+	}
+	for i := range cards {
+		count, ok := workflowCache.counts[cards[i].BuildID]
+		if !ok {
+			continue
+		}
+		cards[i].ActiveWorkflowCount = count
+		pct := (float64(count) / float64(workflowCache.total)) * 100
+		cards[i].ActiveWorkflowPct = &pct
+	}
+	return workflowCache.total, true
+}
+
+func applyPartialCachedWorkflowData(cards []versionCard, total int) {
+	workflowCache.mu.RLock()
+	defer workflowCache.mu.RUnlock()
+	if workflowCache.total != total || len(workflowCache.counts) == 0 {
+		return
+	}
+	for i := range cards {
+		if cards[i].ActiveWorkflowPct != nil {
+			continue
+		}
+		count, ok := workflowCache.counts[cards[i].BuildID]
+		if !ok {
+			continue
+		}
+		cards[i].ActiveWorkflowCount = count
+		pct := (float64(count) / float64(total)) * 100
+		cards[i].ActiveWorkflowPct = &pct
+	}
+}
+
+func writeCachedWorkflowData(total int, counts map[string]int) {
+	copyCounts := make(map[string]int, len(counts))
+	for k, v := range counts {
+		copyCounts[k] = v
+	}
+	workflowCache.mu.Lock()
+	workflowCache.total = total
+	workflowCache.counts = copyCounts
+	workflowCache.updated = time.Now()
+	workflowCache.mu.Unlock()
+}
+
+func clearCachedWorkflowData() {
+	workflowCache.mu.Lock()
+	workflowCache.total = 0
+	workflowCache.counts = nil
+	workflowCache.updated = time.Time{}
+	workflowCache.mu.Unlock()
+}
+
+func writeCachedSlotMetrics(used, cap float64) {
+	slotsCache.mu.Lock()
+	slotsCache.used = used
+	slotsCache.cap = cap
+	slotsCache.updated = time.Now()
+	slotsCache.hasData = true
+	slotsCache.mu.Unlock()
+}
+
+func readCachedSlotMetrics() (*float64, *float64, bool) {
+	slotsCache.mu.RLock()
+	defer slotsCache.mu.RUnlock()
+	if !slotsCache.hasData {
+		return nil, nil, false
+	}
+	if time.Since(slotsCache.updated) > 60*time.Second {
+		return nil, nil, false
+	}
+	used := slotsCache.used
+	cap := slotsCache.cap
+	return &used, &cap, true
 }
 
 func mergeLiveDeploymentData(ctx context.Context, namespace, twdName string, cards []versionCard, cardByBuildID map[string]int) []versionCard {
@@ -445,6 +743,267 @@ func clampPct(v float64) float64 {
 	return v
 }
 
+func loadTemporalAccessConfig(ctx context.Context, twd twdResource) (temporalAccessConfig, error) {
+	connectionName := twd.Spec.WorkerOptions.ConnectionRef.Name
+	if connectionName == "" {
+		connectionName = twd.Metadata.Name
+	}
+	if twd.Spec.WorkerOptions.TemporalNamespace == "" {
+		return temporalAccessConfig{}, fmt.Errorf("Temporal namespace not configured on worker deployment")
+	}
+
+	// Check cache first (5-minute TTL)
+	configCache.mu.RLock()
+	if time.Since(configCache.updated) < 5*time.Minute && configCache.updated.After(time.Time{}) {
+		defer configCache.mu.RUnlock()
+		return configCache.cfg, nil
+	}
+	configCache.mu.RUnlock()
+
+	// Create a shorter timeout for individual kubectl calls (20 sec each)
+	kctx, kcancel := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
+	defer kcancel()
+
+	var conn temporalConnectionResource
+	if err := kubectlJSON(kctx, &conn, "-n", twd.Metadata.Namespace, "get", "temporalconnection", connectionName, "-o", "json"); err != nil {
+		return temporalAccessConfig{}, err
+	}
+
+	cfg := temporalAccessConfig{
+		Address:        conn.Spec.HostPort,
+		Namespace:      twd.Spec.WorkerOptions.TemporalNamespace,
+		SupportsCounts: true,
+	}
+
+	if conn.Spec.APIKeySecretRef != nil {
+		secretData, err := loadSecretData(kctx, twd.Metadata.Namespace, conn.Spec.APIKeySecretRef.Name)
+		if err != nil {
+			return temporalAccessConfig{}, err
+		}
+		cfg.APIKey = secretData[conn.Spec.APIKeySecretRef.Key]
+		if cfg.APIKey == "" {
+			return temporalAccessConfig{}, fmt.Errorf("Temporal API key secret %s/%s missing key %q", twd.Metadata.Namespace, conn.Spec.APIKeySecretRef.Name, conn.Spec.APIKeySecretRef.Key)
+		}
+		// Temporal Cloud endpoints require TLS with API-key auth.
+		cfg.UseTLS = true
+		// Cache the config before returning
+		configCache.mu.Lock()
+		configCache.cfg = cfg
+		configCache.updated = time.Now()
+		configCache.mu.Unlock()
+		return cfg, nil
+	}
+
+	if conn.Spec.MutualTLSSecretRef != nil {
+		secretData, err := loadSecretData(kctx, twd.Metadata.Namespace, conn.Spec.MutualTLSSecretRef.Name)
+		if err != nil {
+			return temporalAccessConfig{}, err
+		}
+		certPath, err := writeTempSecretFile("temporal-client-cert-*.pem", secretData["tls.crt"])
+		if err != nil {
+			return temporalAccessConfig{}, err
+		}
+		keyPath, err := writeTempSecretFile("temporal-client-key-*.pem", secretData["tls.key"])
+		if err != nil {
+			cleanupTempFiles([]string{certPath})
+			return temporalAccessConfig{}, err
+		}
+		cfg.TLSCertPath = certPath
+		cfg.TLSKeyPath = keyPath
+		cfg.UseTLS = true
+		cfg.TempFiles = []string{certPath, keyPath}
+		// Cache the config before returning (note: with temp files, cache only the non-temp parts)
+		cfgCopy := cfg
+		cfgCopy.TempFiles = nil
+		configCache.mu.Lock()
+		configCache.cfg = cfgCopy
+		configCache.updated = time.Now()
+		configCache.mu.Unlock()
+		return cfg, nil
+	}
+
+	return temporalAccessConfig{}, fmt.Errorf("TemporalConnection %s/%s has no API key or mTLS secret configured", twd.Metadata.Namespace, connectionName)
+}
+
+func loadSecretData(ctx context.Context, namespace, name string) (map[string]string, error) {
+	var secret secretResource
+	if err := kubectlJSON(ctx, &secret, "-n", namespace, "get", "secret", name, "-o", "json"); err != nil {
+		return nil, err
+	}
+	decoded := make(map[string]string, len(secret.Data))
+	for key, value := range secret.Data {
+		raw, err := base64.StdEncoding.DecodeString(value)
+		if err != nil {
+			return nil, fmt.Errorf("decode secret %s/%s key %s: %w", namespace, name, key, err)
+		}
+		decoded[key] = string(raw)
+	}
+	return decoded, nil
+}
+
+func writeTempSecretFile(pattern, contents string) (string, error) {
+	file, err := os.CreateTemp("", pattern)
+	if err != nil {
+		return "", err
+	}
+	path := file.Name()
+	if _, err := file.WriteString(contents); err != nil {
+		_ = file.Close()
+		_ = os.Remove(path)
+		return "", err
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(path)
+		return "", err
+	}
+	return path, nil
+}
+
+func cleanupTempFiles(paths []string) {
+	for _, path := range paths {
+		if path != "" {
+			_ = os.Remove(path)
+		}
+	}
+}
+
+// parseTemporalWorkflowCount handles multiple output formats from temporal CLI across versions.
+// Supports:
+// - "Total: N" format (standard)
+// - Plain numeric "N" format (fallback)
+// - JSON format {"count": N} or {"total": N} (future-proofing)
+func parseTemporalWorkflowCount(output string) (int, error) {
+	text := strings.TrimSpace(output)
+	if text == "" {
+		return 0, nil
+	}
+
+	// Try: "Total: N" format (current standard)
+	if strings.HasPrefix(text, "Total:") {
+		text = strings.TrimPrefix(text, "Total:")
+		text = strings.TrimSpace(text)
+		if n, err := strconv.Atoi(text); err == nil {
+			return n, nil
+		}
+		// If parse fails after trimming, fall through to other formats
+	}
+
+	// Try: plain numeric format "N"
+	if n, err := strconv.Atoi(text); err == nil {
+		return n, nil
+	}
+
+	// Try: JSON format {"count": N} or {"total": N}
+	var jsonResp struct {
+		Count int `json:"count"`
+		Total int `json:"total"`
+	}
+	if err := json.Unmarshal([]byte(text), &jsonResp); err == nil {
+		if jsonResp.Count > 0 {
+			return jsonResp.Count, nil
+		}
+		if jsonResp.Total > 0 {
+			return jsonResp.Total, nil
+		}
+	}
+
+	// Unable to parse in any known format
+	return 0, fmt.Errorf("unexpected workflow count format: %q", output)
+}
+
+func temporalWorkflowCount(ctx context.Context, cfg temporalAccessConfig, query string) (int, error) {
+	// Use a shorter timeout for individual temporal CLI calls (15 seconds)
+	tempCtx, tempCancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer tempCancel()
+
+	args := []string{
+		"workflow", "count",
+		"--query", query,
+		"--address", cfg.Address,
+		"--namespace", cfg.Namespace,
+	}
+	if cfg.UseTLS {
+		args = append(args, "--tls")
+	}
+	if cfg.APIKey != "" {
+		args = append(args, "--api-key", cfg.APIKey)
+	}
+	if cfg.TLSCertPath != "" {
+		args = append(args, "--tls-cert-path", cfg.TLSCertPath)
+	}
+	if cfg.TLSKeyPath != "" {
+		args = append(args, "--tls-key-path", cfg.TLSKeyPath)
+	}
+
+	safeArgs := make([]string, 0, len(args))
+	skipNext := false
+	for _, a := range args {
+		if skipNext {
+			skipNext = false
+			safeArgs = append(safeArgs, "***")
+			continue
+		}
+		safeArgs = append(safeArgs, a)
+		if a == "--api-key" {
+			skipNext = true
+		}
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		cmd := exec.CommandContext(tempCtx, "temporal", args...)
+		b, err := cmd.Output()
+		if err == nil {
+			// Use robust parser that handles multiple output formats
+			n, parseErr := parseTemporalWorkflowCount(string(b))
+			if parseErr != nil {
+				log.Printf("dashboard: temporal workflow count parse error (attempt %d/%d): %v; output was: %q", attempt, 3, parseErr, string(b))
+				lastErr = parseErr
+				// Continue to next retry attempt for parse errors
+				if attempt < 3 {
+					select {
+					case <-ctx.Done():
+						break
+					case <-time.After(time.Duration(attempt) * 300 * time.Millisecond):
+					}
+				}
+				continue
+			}
+			return n, nil
+		}
+
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			stderr := strings.TrimSpace(string(ee.Stderr))
+			if stderr != "" {
+				lastErr = fmt.Errorf("temporal %s: %s", strings.Join(safeArgs, " "), stderr)
+			} else {
+				lastErr = fmt.Errorf("temporal %s: %w", strings.Join(safeArgs, " "), err)
+			}
+		} else {
+			lastErr = fmt.Errorf("temporal %s: %w", strings.Join(safeArgs, " "), err)
+		}
+
+		log.Printf("dashboard: temporal workflow count failed (attempt %d/%d): %v", attempt, 3, lastErr)
+
+		if ctx.Err() != nil {
+			break
+		}
+		if attempt < 3 {
+			select {
+			case <-ctx.Done():
+				break
+			case <-time.After(time.Duration(attempt) * 300 * time.Millisecond):
+			}
+		}
+	}
+
+	if lastErr != nil {
+		return 0, lastErr
+	}
+	return 0, fmt.Errorf("temporal %s: workflow count failed", strings.Join(safeArgs, " "))
+}
+
 func kubectlJSON(ctx context.Context, out any, args ...string) error {
 	cmd := exec.CommandContext(ctx, "kubectl", args...)
 	b, err := cmd.Output()
@@ -476,8 +1035,12 @@ func queryPrometheusScalar(ctx context.Context, query string) (*float64, error) 
 	if err := json.Unmarshal(b, &resp); err != nil {
 		return nil, err
 	}
-	if resp.Status != "success" || len(resp.Data.Result) == 0 || len(resp.Data.Result[0].Value) < 2 {
-		return nil, nil
+	if resp.Status != "success" {
+		return nil, fmt.Errorf("prometheus query returned status %q", resp.Status)
+	}
+	if len(resp.Data.Result) == 0 || len(resp.Data.Result[0].Value) < 2 {
+		zero := 0.0
+		return &zero, nil
 	}
 
 	raw, ok := resp.Data.Result[0].Value[1].(string)

@@ -47,6 +47,30 @@ if ! echo "$IMAGE_TAG" | grep -q ":"; then
   exit 1
 fi
 
+# If IMAGE_TAG is not a full ECR reference (e.g., helloworld:sha),
+# normalize it to ACCOUNT.dkr.ecr.REGION.amazonaws.com/helloworld:sha.
+if ! echo "$IMAGE_TAG" | grep -q '\.dkr\.ecr\.'; then
+  EFFECTIVE_REGION="${AWS_REGION:-us-east-2}"
+  AWS_ACCOUNT_ID=""
+  if command -v aws >/dev/null 2>&1; then
+    AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)
+  fi
+
+  if [ -z "$AWS_ACCOUNT_ID" ] || [ "$AWS_ACCOUNT_ID" = "None" ]; then
+    if [ -n "${AWS_ROLE_ARN:-}" ]; then
+      AWS_ACCOUNT_ID=$(echo "$AWS_ROLE_ARN" | cut -d: -f5)
+    fi
+  fi
+
+  if [ -z "$AWS_ACCOUNT_ID" ] || [ "$AWS_ACCOUNT_ID" = "None" ]; then
+    echo "[$TIMESTAMP] ERROR: IMAGE_TAG is not a full ECR reference and AWS account ID could not be detected"
+    exit 1
+  fi
+
+  IMAGE_TAG="${AWS_ACCOUNT_ID}.dkr.ecr.${EFFECTIVE_REGION}.amazonaws.com/${IMAGE_TAG}"
+  echo "[$TIMESTAMP] Normalized IMAGE_TAG to full ECR reference: $IMAGE_TAG"
+fi
+
 # Extract ECR repo, image name, tag
 # Format: ACCOUNT.dkr.ecr.REGION.amazonaws.com/IMAGE:TAG
 IMAGE_TAG_WITHOUT_SUFFIX=$(echo "$IMAGE_TAG" | cut -d: -f1)
@@ -55,10 +79,15 @@ IMAGE_NAME=$(echo "$IMAGE_TAG_WITHOUT_SUFFIX" | sed 's|.*/||')
 ECR_REPO="${IMAGE_TAG_WITHOUT_SUFFIX%/*}"
 
 # Extract AWS region from ECR URI if present
-AWS_REGION=$(echo "$ECR_REPO" | grep -oP 'ecr\.\K[a-z0-9-]+' || echo "")
-if [ -z "$AWS_REGION" ]; then
-  AWS_REGION="${AWS_REGION:-us-east-2}"
+PARSED_AWS_REGION=$(echo "$ECR_REPO" | sed -n 's#.*\.ecr\.\([a-z0-9-][a-z0-9-]*\)\.amazonaws\.com.*#\1#p')
+AWS_REGION="${PARSED_AWS_REGION:-${AWS_REGION:-us-east-2}}"
+if [ -z "$PARSED_AWS_REGION" ]; then
   echo "[$TIMESTAMP] WARNING: Could not detect AWS_REGION from ECR URI, using $AWS_REGION"
+fi
+
+if ! echo "$ECR_REPO" | grep -q '\.dkr\.ecr\.'; then
+  echo "[$TIMESTAMP] ERROR: IMAGE_TAG must be a full ECR image reference, got $IMAGE_TAG"
+  exit 1
 fi
 
 echo "[$TIMESTAMP] ECR Repo: $ECR_REPO"

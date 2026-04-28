@@ -22,6 +22,7 @@ SKIP_DEPLOY="${SKIP_DEPLOY:-0}"
 START_VERSION="${START_VERSION:-1}"
 
 echo "[$(date '+%H:%M:%S')] Starting continuous version generation"
+echo "[$(date '+%H:%M:%S')] kubectl context=$(kubectl config current-context 2>/dev/null || echo unknown)"
 echo "[$(date '+%H:%M:%S')] DELAY_SECONDS=${DELAY_SECONDS} MAX_VERSIONS=${MAX_VERSIONS} START_VERSION=${START_VERSION}"
 if [ "$SKIP_DEPLOY" = "1" ]; then
   echo "[$(date '+%H:%M:%S')] SKIP_DEPLOY=1: will commit but not deploy"

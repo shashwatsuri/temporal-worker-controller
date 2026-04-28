@@ -145,6 +145,26 @@ internal/demo/scripts/reset_rainbow_demo.sh
 
 By default this performs a hard reset (`HARD_RESET=1`): it deletes the existing `helloworld` release/TWD first, then redeploys baseline so old build IDs are cleared. The dashboard UI process is not stopped automatically.
 
+Generate continuous rainbow versions with overlap:
+
+```bash
+DELAY_SECONDS=60 MAX_VERSIONS=6 sh internal/demo/scripts/continuous_versions.sh
+```
+
+On EKS, include your ECR repo when running the same command:
+
+```bash
+SKAFFOLD_DEFAULT_REPO=<account>.dkr.ecr.<region>.amazonaws.com \
+DELAY_SECONDS=60 MAX_VERSIONS=6 \
+sh internal/demo/scripts/continuous_versions.sh
+```
+
+Important routing semantics for this demo:
+
+- New workflow starts are routed only between current and ramping target versions.
+- Deprecated/draining versions do not receive new starts, but continue processing pinned, in-flight workflows.
+- The dashboard hides deprecated cards by default, while still counting active overlap through draining/pinned activity.
+
 ### Monitoring 
 
 You can monitor the controller's logs and the worker's status using:
@@ -413,4 +433,316 @@ minikube delete --all --purge
 - `--all`: Deletes ALL minikube clusters (not just the default one)
 - `--purge`: Completely removes all minikube data, cached images, and configuration files from your machine
 
-This gives you a completely fresh start and frees up disk space used by minikube. 
+This gives you a completely fresh start and frees up disk space used by minikube.
+
+---
+
+## Temporal Schedule-Based Version Generation (Recommended)
+
+The recommended release trigger is now a Temporal Schedule that starts a release workflow on a fixed interval. The workflow creates a one-shot Kubernetes Job that runs the existing generation/build/deploy scripts (`generate_version_cron.sh`, `build_version_kaniko.sh`, `deploy_version_skaffold.sh`).
+
+The schedule path runs deploys in non-blocking mode (`WAIT_FOR_TWD_ROLLOUT=0`) so a new target version can be submitted even while the current version is still handling/draining active workflows.
+
+This keeps schedule semantics in Temporal while reusing the current image build and rollout pipeline.
+
+### Deploy Temporal Schedule Trigger
+
+```bash
+# Deploy release manager and release job runner images/manifests
+skaffold deploy --profile rainbow-release
+
+# Or use the helper, which also suspends the legacy CronJob trigger
+sh internal/demo/scripts/switch_to_temporal_schedule.sh
+```
+
+### Validate Schedule Trigger
+
+```bash
+# Release manager pod (should be Running)
+kubectl -n default get pods -l app.kubernetes.io/name=release-manager
+
+# Legacy CronJob should be suspended if helper script was used
+kubectl -n default get cronjob rainbow-version-generator -o jsonpath='{.spec.suspend}'
+
+# TemporalWorkerDeployment should keep receiving new target builds over time
+kubectl -n default get temporalworkerdeployment helloworld -o json | jq '.status | {currentVersion,targetVersion,conditions}'
+```
+
+### Key Configuration
+
+- Schedule interval: `schedule.cron` in `internal/demo/release/helm/release-manager/values.yaml`
+- Schedule ID: `schedule.id`
+- Overlap policy: set in code to `SCHEDULE_OVERLAP_POLICY_SKIP`
+- Rollout wait behavior for scheduled deploy jobs: `release.waitForTWDRollout` (default `false` so new versions continue to deploy while prior versions drain)
+- Release job image: `job.image.repository` and `job.image.tag`
+
+---
+
+## Kubernetes CronJob-Based Version Generation (EKS)
+
+This path is now legacy/fallback. Prefer the Temporal Schedule-based trigger above.
+
+Instead of running the perpetual `continuous_versions.sh` loop locally, you can deploy a Kubernetes CronJob that automatically generates and deploys new rainbow worker versions on a schedule. This is ideal for EKS deployments where the cluster runs continuously.
+
+### Prerequisites for CronJob Setup
+
+1. **AWS Account and EKS cluster**: Cluster must have IRSA (IAM Roles for Service Accounts) enabled
+2. **ECR repository**: For pushing multi-architecture images
+3. **Kubectl access**: To the EKS cluster
+4. **AWS CLI**: Configured with credentials to create IAM roles
+
+### Deploy the CronJob
+
+#### Step 1: Create IAM Role for IRSA
+
+Create an IAM role that allows the CronJob pods to push images to ECR and access Kubernetes APIs:
+
+```bash
+# Set your AWS account ID and region
+ACCOUNT_ID=025066239481
+REGION=us-east-2
+CLUSTER_NAME=temporal-rainbow-deployment-demo
+OIDC_ID=$(aws eks describe-cluster --name $CLUSTER_NAME --region $REGION --query 'cluster.identity.oidc.issuer' --output text | cut -d '/' -f 5)
+
+# Create the IAM role
+ROLE_NAME=rainbow-version-generator-role
+TRUST_POLICY="{
+  \"Version\": \"2012-10-17\",
+  \"Statement\": [
+    {
+      \"Effect\": \"Allow\",
+      \"Principal\": {
+        \"Federated\": \"arn:aws:iam::$ACCOUNT_ID:oidc-provider/oidc.eks.$REGION.amazonaws.com/id/$OIDC_ID\"
+      },
+      \"Action\": \"sts:AssumeRoleWithWebIdentity\",
+      \"Condition\": {
+        \"StringEquals\": {
+          \"oidc.eks.$REGION.amazonaws.com/id/$OIDC_ID:sub\": \"system:serviceaccount:default:rainbow-version-generator\",
+          \"oidc.eks.$REGION.amazonaws.com/id/$OIDC_ID:aud\": \"sts.amazonaws.com\"
+        }
+      }
+    }
+  ]
+}"
+
+aws iam create-role \
+  --role-name $ROLE_NAME \
+  --assume-role-policy-document "$TRUST_POLICY" \
+  --region $REGION || echo "Role may already exist"
+
+# Attach ECR permissions
+aws iam put-role-policy \
+  --role-name $ROLE_NAME \
+  --policy-name ECRAccess \
+  --policy-document "{
+    \"Version\": \"2012-10-17\",
+    \"Statement\": [
+      {
+        \"Effect\": \"Allow\",
+        \"Action\": [
+          \"ecr:GetAuthorizationToken\",
+          \"ecr:GetDownloadUrlForLayer\",
+          \"ecr:BatchGetImage\",
+          \"ecr:PutImage\",
+          \"ecr:InitiateLayerUpload\",
+          \"ecr:UploadLayerPart\",
+          \"ecr:CompleteLayerUpload\",
+          \"ecr:BatchCheckLayerAvailability\",
+          \"ecr:DescribeImages\",
+          \"ecr:ListImages\"
+        ],
+        \"Resource\": \"arn:aws:ecr:$REGION:$ACCOUNT_ID:repository/helloworld*\"
+      }
+    ]
+  }" \
+  --region $REGION
+```
+
+#### Step 2: Update CronJob Manifest
+
+Edit `internal/demo/k8s/rainbow-cronjob.yaml` and replace:
+- `ACCOUNT_ID` with your AWS account ID (e.g., 025066239481)
+- `REGION` with your AWS region (e.g., us-east-2)
+- `REPO_URL` and `REPO_REF` if using a fork or different branch
+
+#### Step 3: Apply CronJob Resources
+
+```bash
+# Apply the CronJob, ServiceAccount, RBAC, and ConfigMaps
+kubectl apply -f internal/demo/k8s/rainbow-cronjob.yaml
+
+# Verify resources were created
+kubectl get cronjob rainbow-version-generator
+kubectl get sa rainbow-version-generator
+kubectl get configmap rainbow-version-state
+```
+
+#### Step 4: Verify the CronJob
+
+The CronJob runs every 5 minutes by default. Monitor its progress:
+
+```bash
+# Watch for new jobs
+kubectl get jobs -l app=rainbow-version-generator -w
+
+# View logs from the latest job
+JOB=$(kubectl get jobs -l app=rainbow-version-generator -o name | sort -V | tail -1)
+kubectl logs $JOB -c orchestrator
+
+# Check version state
+kubectl get configmap rainbow-version-state -o yaml
+
+# Verify new versions were deployed
+kubectl port-forward svc/rainbow-dashboard 8787:8787 &
+curl -s http://localhost:8787/api/state | jq '.versionCount'
+```
+
+### Manual Job Trigger
+
+To manually run the version generator outside the CronJob schedule:
+
+```bash
+# Create a one-time job from the CronJob template
+kubectl create job rainbow-version-manual-$(date +%s) --from=cronjob/rainbow-version-generator
+
+# Watch the job
+kubectl get jobs -w
+
+# View logs
+JOB=$(kubectl get jobs -o name | grep rainbow-version-manual | sort -V | tail -1)
+kubectl logs $JOB -c orchestrator -f
+```
+
+### Monitoring and Troubleshooting
+
+#### View CronJob Status
+
+```bash
+kubectl describe cronjob rainbow-version-generator
+kubectl get events -A --sort-by='.lastTimestamp' | grep rainbow
+```
+
+#### Check Job Logs
+
+```bash
+# List all version generator jobs
+kubectl get jobs -l app=rainbow-version-generator
+
+# View successful job logs
+kubectl logs <job-name> -c orchestrator
+
+# View failed job logs with full output
+kubectl logs <job-name> -c orchestrator --all-containers=true
+```
+
+#### Emit Diagnostics
+
+The CronJob pod includes a diagnostic utility. To run it:
+
+```bash
+# Run diagnostics in a pod
+kubectl run -it --rm diagnostics \
+  --image=alpine:3.18 \
+  --serviceaccount=rainbow-version-generator \
+  -- sh -c "apk add jq kubectl; kubectl get configmap rainbow-version-state -o yaml"
+```
+
+### Rollback Procedures
+
+#### Option 1: Disable the CronJob (Keep Infrastructure)
+
+If versions are being generated incorrectly, pause new generation:
+
+```bash
+# Disable the CronJob
+kubectl patch cronjob rainbow-version-generator --type merge -p '{"spec":{"suspend":true}}'
+
+# Re-enable later
+kubectl patch cronjob rainbow-version-generator --type merge -p '{"spec":{"suspend":false}}'
+```
+
+#### Option 2: Restore to Baseline Version
+
+Redeploy the baseline helloworld worker without version mutations:
+
+```bash
+# This resets worker.go to baseline and redeployes
+sh internal/demo/scripts/reset_rainbow_demo.sh
+
+# Or manually via Helm:
+skaffold deploy --profile helloworld-worker
+```
+
+#### Option 3: Delete and Recreate CronJob
+
+If the CronJob is in a bad state:
+
+```bash
+# Delete all CronJob resources
+kubectl delete cronjob,sa,clusterrole,clusterrolebinding,configmap \
+  -l app=rainbow-version-generator
+
+# Recreate from manifest
+kubectl apply -f internal/demo/k8s/rainbow-cronjob.yaml
+```
+
+#### Option 4: Examine and Fix Version State
+
+If version numbering is corrupted:
+
+```bash
+# View current state
+kubectl get configmap rainbow-version-state -o jsonpath='{.data.current_version}'
+
+# Reset version counter to 0
+kubectl patch configmap rainbow-version-state \
+  --type merge \
+  -p '{"data":{"current_version":"0"}}'
+
+# Delete version generator jobs and let them restart
+kubectl delete jobs -l app=rainbow-version-generator
+```
+
+### CronJob Architecture
+
+The CronJob orchestrates three phases:
+
+1. **Phase 1 - Version Generation** (`generate_version_cron.sh`):
+   - Reads version counter from ConfigMap
+   - Checks out repository at specified ref
+   - Mutates `worker.go` with version-specific sleep and greeting
+   - Commits changes and gets git SHA
+
+2. **Phase 2 - Build** (`build_version_kaniko.sh`):
+   - Builds linux/amd64 image using Kaniko
+   - Builds linux/arm64 image using Kaniko
+   - Creates and pushes manifest list to ECR
+   - Uses IRSA for ECR authentication
+
+3. **Phase 3 - Deploy** (`deploy_version_skaffold.sh`):
+   - Uses `skaffold deploy` with precomputed image tag
+   - Avoids rebuilding image; uses pre-built manifest list
+   - Waits for TemporalWorkerDeployment rollout
+   - Verifies deployment succeeded
+
+### Performance Tuning
+
+- **Schedule interval**: Edit `spec.schedule` in `rainbow-cronjob.yaml` (default: `*/5 * * * *`)
+- **Concurrency**: Set `concurrencyPolicy` to `Forbid` (default) or `Replace` for single-run guarantee
+- **Resource limits**: Adjust `resources.limits` based on your cluster capacity
+- **Retry policy**: Modify `backoffLimit` (default: 1) to control failure retries
+- **History**: Adjust `successfulJobsHistoryLimit` and `failedJobsHistoryLimit` for log retention
+
+### Disabling the CronJob
+
+To remove automatic version generation and return to manual control:
+
+```bash
+# Delete the CronJob while keeping dashboard infrastructure
+kubectl delete cronjob rainbow-version-generator
+
+# Keep running perpetual loop locally (if desired)
+SKAFFOLD_DEFAULT_REPO=025066239481.dkr.ecr.us-east-2.amazonaws.com \
+DELAY_SECONDS=180 \
+sh internal/demo/scripts/continuous_versions.sh
+``` 

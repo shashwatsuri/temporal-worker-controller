@@ -1,0 +1,40 @@
+# Build dashboard binary
+FROM golang:1.25 AS builder
+ARG TARGETOS
+ARG TARGETARCH
+ARG TEMPORAL_CLI_VERSION=1.6.2
+
+WORKDIR /workspace
+COPY go.mod go.mod
+COPY go.sum go.sum
+RUN go mod download
+
+# Copy dashboard source (context is root)
+COPY internal/demo/dashboard ./internal/demo/dashboard
+COPY internal/demo/util ./internal/demo/util
+
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
+    go build -o dashboard ./internal/demo/dashboard
+
+RUN set -eux; \
+    arch="${TARGETARCH:-}"; \
+    if [ -z "$arch" ]; then \
+        case "$(uname -m)" in \
+            x86_64) arch="amd64" ;; \
+            aarch64|arm64) arch="arm64" ;; \
+            *) echo "unsupported architecture: $(uname -m)"; exit 1 ;; \
+        esac; \
+    fi; \
+    curl -fsSL "https://github.com/temporalio/cli/releases/download/v${TEMPORAL_CLI_VERSION}/temporal_cli_${TEMPORAL_CLI_VERSION}_linux_${arch}.tar.gz" -o /tmp/temporal.tar.gz; \
+    tar -xzf /tmp/temporal.tar.gz -C /tmp temporal; \
+    rm -f /tmp/temporal.tar.gz
+
+# Runtime image with kubectl available for API calls
+FROM bitnami/kubectl:latest
+WORKDIR /
+COPY --from=builder /workspace/dashboard .
+COPY --from=builder /tmp/temporal /usr/local/bin/temporal
+
+EXPOSE 8787
+ENTRYPOINT ["/dashboard"]
+CMD ["--namespace", "default", "--name", "helloworld", "--port", "8787"]

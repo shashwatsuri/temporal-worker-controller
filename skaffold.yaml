@@ -51,6 +51,10 @@ profiles:
   # Build and deploy the helloworld Custom Resource to the local k8s cluster  
   - name: helloworld-worker
     build:
+      local:
+        push: false
+      platforms:
+        - linux/arm64
       artifacts:
         - image: helloworld
           context: internal/demo
@@ -107,6 +111,10 @@ profiles:
           - name: rainbow-release-manager
             chartPath: internal/demo/release/helm/release-manager
             setValueTemplates:
+              manager.image.repository: "{{ .IMAGE_REPO_rainbow_release_manager }}"
+              manager.image.tag: "{{ .IMAGE_TAG_rainbow_release_manager }}"
+              job.image.repository: "{{ .IMAGE_REPO_rainbow_release_job }}"
+              job.image.tag: "{{ .IMAGE_TAG_rainbow_release_job }}"
               temporal.namespace: "{{ .TEMPORAL_NAMESPACE }}"
               temporal.address: "{{ .TEMPORAL_ADDRESS }}"
               temporal.mtlsSecretName: "{{ .TEMPORAL_MTLS_SECRET_NAME }}"

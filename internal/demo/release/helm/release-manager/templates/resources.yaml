@@ -176,6 +176,8 @@ spec:
               value: {{ .Values.release.stateConfigMapName | quote }}
             - name: RELEASE_AWS_REGION
               value: {{ .Values.release.awsRegion | quote }}
+            - name: RELEASE_WAIT_FOR_TWD_ROLLOUT
+              value: {{ .Values.release.waitForTWDRollout | quote }}
             - name: RELEASE_JOB_TTL_SECONDS
               value: {{ .Values.release.jobTTLSeconds | quote }}
             - name: RELEASE_JOB_TIMEOUT

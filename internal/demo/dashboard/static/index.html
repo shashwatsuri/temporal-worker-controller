@@ -164,6 +164,19 @@
       width: 100%;
     }
 
+    .traffic-group {
+      margin-top: 8px;
+    }
+
+    .traffic-group:first-child {
+      margin-top: 0;
+    }
+
+    .traffic-label {
+      font-size: 12px;
+      color: var(--muted);
+    }
+
     .bar {
       margin-top: 8px;
       height: 10px;
@@ -250,6 +263,8 @@
   <script>
     const statusEl = document.getElementById("statusMsg");
     const versionsEl = document.getElementById("versions");
+    // Keep versions visible across refreshes until their active workload reaches 0.
+    const retainedVersions = new Map();
 
     function fmtPct(v) {
       if (typeof v !== "number") return "n/a";
@@ -287,14 +302,52 @@
       statusEl.classList.add(level);
     }
 
+    function shouldHideVersion(v) {
+      const status = (v?.status || "").toLowerCase();
+      const role = (v?.role || "").toLowerCase();
+      const isCurrentOrTarget = role.includes("current") || role.includes("target");
+      const isDeprecatedLike = role.includes("deprecated") || status === "draining" || status === "drained" || status === "inactive";
+      const hasActiveCount = typeof v?.activeWorkflowCount === "number" && v.activeWorkflowCount > 0;
+      const hasActivePct = typeof v?.activeWorkflowPct === "number" && v.activeWorkflowPct > 0;
+      const hasTrafficPct = typeof v?.trafficPct === "number" && v.trafficPct > 0;
+      const hasAnySignal = hasActiveCount || hasActivePct || hasTrafficPct;
+      const hasNoActiveTelemetry = v?.activeWorkflowCount == null && v?.activeWorkflowPct == null;
+      const readyReplicas = typeof v?.readyReplicas === "number" ? v.readyReplicas : 0;
+
+      if (isCurrentOrTarget || hasAnySignal) {
+        return false;
+      }
+
+      // Always suppress deprecated/inactive rows once they stop carrying workload/traffic.
+      if (isDeprecatedLike) {
+        return true;
+      }
+
+      // If telemetry is temporarily unavailable, avoid showing idle historical rows.
+      if (hasNoActiveTelemetry && readyReplicas <= 0) {
+        return true;
+      }
+
+      return false;
+    }
+
     function render(data) {
       document.getElementById("scope").textContent = `${data.namespace}/${data.name}`;
       document.getElementById("tick").textContent = `Updated ${new Date(data.fetchedAt).toLocaleTimeString()}`;
-      document.getElementById("activeVersions").textContent = String(data.activeVersions ?? 0);
+      const activeVersionsEl = document.getElementById("activeVersions");
+      activeVersionsEl.textContent = String(data.activeVersions ?? 0);
 
       const util = typeof data.slotUtilizationPct === "number" ? `${data.slotUtilizationPct.toFixed(1)}%` : "-";
       document.getElementById("slotUtilization").textContent = util;
-      document.getElementById("slotHint").textContent = data.metricsNote || `Pinned likely: ${data.pinnedLikely ? "yes" : "no"}`;
+      const slotHintParts = [];
+      if (typeof data.activeWorkflowTotal === "number" && data.activeWorkflowTotal > 0) {
+        slotHintParts.push(`Running workflows: ${data.activeWorkflowTotal}`);
+      }
+      if (data.activeWorkflowNote && !String(data.activeWorkflowNote).toLowerCase().includes("temporarily unavailable")) {
+        slotHintParts.push(data.activeWorkflowNote);
+      }
+      slotHintParts.push(data.metricsNote || `Pinned likely: ${data.pinnedLikely ? "yes" : "no"}`);
+      const slotHintEl = document.getElementById("slotHint");
 
       const used = typeof data.slotsUsed === "number" ? data.slotsUsed.toFixed(1) : "-";
       const cap = typeof data.slotsCapacity === "number" ? data.slotsCapacity.toFixed(1) : "-";
@@ -323,10 +376,78 @@
         statusEl.textContent = `Not Ready: ${data.ready?.reason || "Unknown"} - ${data.ready?.message || ""}`;
       }
 
-      const visibleVersions = (data.versions || []).filter((v) => {
-        const role = (v.role || "").toLowerCase();
-        return !role.includes("deprecated");
-      });
+      const incomingVersions = Array.isArray(data.versions) ? data.versions : [];
+      const now = Date.now();
+      const visibleVersions = [];
+
+      // Update retention cache from current payload.
+      for (const v of incomingVersions) {
+        const buildId = v?.buildId;
+        if (buildId) {
+          const prev = retainedVersions.get(buildId);
+          const next = { ...v, lastSeenAt: now };
+          // If this refresh can't resolve active workload count, keep last known count.
+          if (typeof next.activeWorkflowCount !== "number" && prev && typeof prev.activeWorkflowCount === "number") {
+            next.activeWorkflowCount = prev.activeWorkflowCount;
+          }
+          retainedVersions.set(buildId, next);
+        }
+      }
+
+      const activeTotal = (typeof data.activeWorkflowTotal === "number" && data.activeWorkflowTotal > 0)
+        ? data.activeWorkflowTotal
+        : null;
+
+      // Primary rows are whatever backend currently reports, excluding fully drained/inactive ones.
+      for (const v of incomingVersions) {
+        if (shouldHideVersion(v)) {
+          if (v?.buildId) {
+            retainedVersions.delete(v.buildId);
+          }
+          continue;
+        }
+        visibleVersions.push(v);
+      }
+
+      // Add retained rows that disappeared from API but still have active workload.
+      const incomingIds = new Set(incomingVersions.map(v => v?.buildId).filter(Boolean));
+      for (const [buildId, cached] of retainedVersions.entries()) {
+        if (incomingIds.has(buildId)) continue;
+
+        const count = typeof cached.activeWorkflowCount === "number" ? cached.activeWorkflowCount : 0;
+        const pct = typeof cached.activeWorkflowPct === "number" ? cached.activeWorkflowPct : 0;
+
+        if (count > 0 || pct > 0) {
+          visibleVersions.push({
+            ...cached,
+            role: cached.role || "historical",
+            status: cached.status || "Draining",
+            draining: true,
+          });
+          continue;
+        }
+
+        // Drop entries once active workload is known to be zero.
+        retainedVersions.delete(buildId);
+      }
+      let knownActiveCount = 0;
+      if (activeTotal !== null) {
+        for (const v of visibleVersions) {
+          if (typeof v.activeWorkflowCount === "number" && v.activeWorkflowCount >= 0) {
+            knownActiveCount += v.activeWorkflowCount;
+          }
+        }
+      }
+      if (activeTotal !== null) {
+        const unattributedCount = Math.max(0, activeTotal - knownActiveCount);
+        if (unattributedCount > 0) {
+          const unattributedPct = (unattributedCount / activeTotal) * 100;
+          slotHintParts.push(`Unattributed active workload: ${unattributedCount} (${unattributedPct.toFixed(1)}%)`);
+        }
+      }
+      activeVersionsEl.textContent = String(visibleVersions.length);
+      activeVersionsEl.title = `Visible versions: ${visibleVersions.length}; backend reported: ${data.activeVersions ?? 0}`;
+      slotHintEl.textContent = slotHintParts.join(" | ");
 
       versionsEl.innerHTML = "";
       visibleVersions.forEach((v, index) => {
@@ -338,39 +459,32 @@
         const role = roleLabel(v);
         const isDraining = v.draining === true;
         const status = (v.status || "unknown").toLowerCase();
+        const showStatusBadge = status !== "draining" && status !== "inactive";
 
-        // Traffic bar logic:
-        // - current/ramping: show % of new workflow starts routed here
-        // - draining: show replica-based bar (they serve pinned workflows, not new starts)
-        // - inactive/other: empty bar
-        let trafficLabel, trafficBarPct;
-        if (isDraining) {
-          trafficLabel = `draining pinned workflows`;
-          // Show a bar proportional to ready replicas (max assumed 10 for display)
-          const maxReplicas = Math.max(v.replicas || 1, 10);
-          trafficBarPct = Math.min(100, ((v.readyReplicas || 0) / maxReplicas) * 100);
-        } else if (typeof v.trafficPct === "number") {
-          trafficLabel = `${v.trafficPct.toFixed(1)}% new workflows`;
-          trafficBarPct = Math.max(0, Math.min(100, v.trafficPct));
-        } else {
-          trafficLabel = status === "inactive" ? "registered, not ramping yet" : "no new workflows";
-          trafficBarPct = 0;
+        let activePct = 0;
+        let activeLabel = "active workflows unavailable";
+        if (activeTotal !== null && typeof v.activeWorkflowCount === "number" && v.activeWorkflowCount >= 0) {
+          activePct = Math.max(0, Math.min(100, (v.activeWorkflowCount / activeTotal) * 100));
+          activeLabel = `${activePct.toFixed(1)}% active workflows (${v.activeWorkflowCount})`;
+        } else if (typeof v.activeWorkflowPct === "number") {
+          activePct = Math.max(0, Math.min(100, v.activeWorkflowPct));
+          activeLabel = `${v.activeWorkflowPct.toFixed(1)}% active workflows (${v.activeWorkflowCount || 0})`;
         }
-
-        // Draining versions use a muted amber color to distinguish them from active routing
-        const barColor = isDraining ? "var(--warn)" : color;
 
         row.innerHTML = `
           <div class="row-top">
             <div>
               <span class="badge" style="color:${color};border-color:${color}">${versionLabel}</span>
               <span class="badge">${role}</span>
-              <span class="badge" style="${isDraining ? `color:var(--warn);border-color:var(--warn)` : ``}">${status}</span>
+              ${showStatusBadge ? `<span class="badge" style="${isDraining ? `color:var(--warn);border-color:var(--warn)` : ``}">${status}</span>` : ""}
               <div class="build">${v.buildId || "unknown build id"}</div>
             </div>
             <div class="traffic">
-              <div>${trafficLabel}</div>
-              <div class="bar"><div class="fill" style="width:${trafficBarPct}%;background:${barColor}"></div></div>
+              <div class="traffic-group">
+                <div class="traffic-label">Active workload</div>
+                <div>${activeLabel}</div>
+                <div class="bar"><div class="fill" style="width:${activePct}%;background:${color}"></div></div>
+              </div>
             </div>
           </div>
           <div class="meta">
@@ -395,7 +509,7 @@
     }
 
     refresh();
-    setInterval(refresh, 1000);
+    setInterval(refresh, 3000);
   </script>
 </body>
 </html>
