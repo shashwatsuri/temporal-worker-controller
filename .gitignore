@@ -13,3 +13,6 @@ cover.out
 
 .claude
 config
+
+# compiled local binaries
+/dashboard

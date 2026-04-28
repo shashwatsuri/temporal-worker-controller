@@ -37,5 +37,6 @@ release:
   stateConfigMapName: rainbow-version-state
   awsRegion: us-east-2
   awsRoleArn: ""
+  waitForTWDRollout: false
   jobTTLSeconds: 300
   jobTimeout: 40m

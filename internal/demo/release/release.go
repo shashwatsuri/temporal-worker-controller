@@ -48,6 +48,7 @@ type Config struct {
 	JobServiceAccount string
 	StateConfigMap    string
 	AWSRegion         string
+	WaitForTWDRollout bool
 	JobTTLSeconds     int32
 	JobTimeout        time.Duration
 }
@@ -63,6 +64,7 @@ type Request struct {
 	JobServiceAccount string
 	StateConfigMap    string
 	AWSRegion         string
+	WaitForTWDRollout bool
 	JobTTLSeconds     int32
 	JobTimeout        time.Duration
 }
@@ -83,6 +85,7 @@ func NewRequest(cfg Config) Request {
 		JobServiceAccount: cfg.JobServiceAccount,
 		StateConfigMap:    cfg.StateConfigMap,
 		AWSRegion:         cfg.AWSRegion,
+		WaitForTWDRollout: cfg.WaitForTWDRollout,
 		JobTTLSeconds:     cfg.JobTTLSeconds,
 		JobTimeout:        cfg.JobTimeout,
 	}
@@ -250,6 +253,7 @@ func buildJob(jobName string, req Request) *batchv1.Job {
 							{Name: "WORKER", Value: req.Worker},
 							{Name: "CONFIG_MAP_NAME", Value: req.StateConfigMap},
 							{Name: "AWS_REGION", Value: req.AWSRegion},
+							{Name: "WAIT_FOR_TWD_ROLLOUT", Value: fmt.Sprintf("%t", req.WaitForTWDRollout)},
 						},
 						Resources: corev1.ResourceRequirements{},
 					}},
@@ -272,7 +276,7 @@ trap 'rm -rf "$WORK_DIR"' EXIT
 git clone --depth 1 --branch "$REPO_REF" "$REPO_URL" "$WORK_DIR/repo"
 cd "$WORK_DIR/repo"
 
-IMAGE_TAG=$(sh internal/demo/scripts/generate_version_cron.sh | tail -n 1)
+	IMAGE_TAG=$(ROOT_DIR="$WORK_DIR/repo" /opt/release-scripts/generate_version_cron.sh | tail -n 1)
 if [ -z "$IMAGE_TAG" ]; then
   echo "[$TIMESTAMP] ERROR: generate_version_cron.sh did not produce an image tag"
   exit 1
@@ -281,8 +285,8 @@ fi
 export DD_GIT_COMMIT_SHA=$(git rev-parse HEAD)
 export DD_GIT_REPOSITORY_URL="$REPO_URL"
 
-sh internal/demo/scripts/build_version_kaniko.sh "$IMAGE_TAG"
-sh internal/demo/scripts/deploy_version_skaffold.sh "$IMAGE_TAG" "$NAMESPACE" "$RELEASE_NAME"
+	/opt/release-scripts/build_version_kaniko.sh "$IMAGE_TAG"
+	/opt/release-scripts/deploy_version_skaffold.sh "$IMAGE_TAG" "$NAMESPACE" "$RELEASE_NAME"
 `)
 }
 

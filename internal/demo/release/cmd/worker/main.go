@@ -67,6 +67,7 @@ func loadConfig() release.Config {
 		JobServiceAccount: getEnv("RELEASE_JOB_SERVICE_ACCOUNT", "rainbow-version-generator"),
 		StateConfigMap:    getEnv("RELEASE_STATE_CONFIGMAP", "rainbow-version-state"),
 		AWSRegion:         getEnv("RELEASE_AWS_REGION", "us-east-2"),
+		WaitForTWDRollout: getEnvBool("RELEASE_WAIT_FOR_TWD_ROLLOUT", false),
 		JobTTLSeconds:     int32(getEnvInt("RELEASE_JOB_TTL_SECONDS", 300)),
 		JobTimeout:        getEnvDuration("RELEASE_JOB_TIMEOUT", 40*time.Minute),
 	}

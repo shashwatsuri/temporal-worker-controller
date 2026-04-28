@@ -21,7 +21,6 @@ skaffold.example.env
 # Build artifacts
 bin/
 helm/
-internal/demo
 
 # IDE
 .vscode

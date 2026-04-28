@@ -1,0 +1,145 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rainbow-dashboard
+  namespace: default
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: rainbow-dashboard
+rules:
+  - apiGroups: ["temporal.io"]
+    resources: ["temporalworkerdeployments", "temporalconnections"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["services", "services/proxy"]
+    verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: rainbow-dashboard
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: rainbow-dashboard
+subjects:
+  - kind: ServiceAccount
+    name: rainbow-dashboard
+    namespace: default
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rainbow-dashboard
+  namespace: default
+  labels:
+    app: rainbow-dashboard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rainbow-dashboard
+  template:
+    metadata:
+      labels:
+        app: rainbow-dashboard
+    spec:
+      serviceAccountName: rainbow-dashboard
+      containers:
+        - name: dashboard
+          image: 025066239481.dkr.ecr.us-east-2.amazonaws.com/rainbow-dashboard:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8787
+              name: http
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          args:
+            - "--namespace"
+            - "$(NAMESPACE)"
+            - "--name"
+            - "helloworld"
+            - "--port"
+            - "8787"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 512Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rainbow-dashboard
+  namespace: default
+  labels:
+    app: rainbow-dashboard
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8787
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    app: rainbow-dashboard
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rainbow-dashboard
+  namespace: default
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    # Set this to your ACM certificate ARN before applying.
+    alb.ingress.kubernetes.io/certificate-arn: "arn:aws:acm:us-east-2:025066239481:certificate/f1084339-83cd-471a-964a-877799ef8239"
+    alb.ingress.kubernetes.io/healthcheck-path: /api/state
+    alb.ingress.kubernetes.io/success-codes: "200"
+spec:
+  ingressClassName: alb
+  rules:
+    - host: replay-demo.bitovi.com
+      http:
+        paths:
+          - path: /metrics
+            pathType: Prefix
+            backend:
+              service:
+                name: helloworld-worker-metrics
+                port:
+                  number: 9090
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: rainbow-dashboard
+                port:
+                  number: 8787
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: rainbow-dashboard
+                port:
+                  number: 8787

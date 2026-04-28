@@ -168,13 +168,23 @@ start-sample-workflow: ## Start a sample workflow.
 	API_KEY_VAL=""; \
 	if [ -n "$$TEMPORAL_API_KEY" ]; then API_KEY_VAL="$$TEMPORAL_API_KEY"; \
 	elif [ -f certs/api-key.txt ]; then API_KEY_VAL="$$(tr -d '\r\n' < certs/api-key.txt)"; fi; \
+	VERSIONING_FLAG=""; \
+	if $(TEMPORAL) workflow start --help 2>/dev/null | grep -q -- "--versioning-override-behavior"; then \
+	  VERSIONING_FLAG="--versioning-override-behavior pinned"; \
+	elif $(TEMPORAL) workflow start --help 2>/dev/null | grep -q -- "--versioning-intent"; then \
+	  VERSIONING_FLAG="--versioning-intent pinned"; \
+	else \
+	  echo "INFO: Temporal CLI does not support pinned start flags; relying on worker default versioning behavior for pinning" >&2; \
+	fi; \
 	if [ -n "$$API_KEY_VAL" ]; then \
 	  $(TEMPORAL) workflow start --type "HelloWorld" --task-queue "default/helloworld" \
+	    $$VERSIONING_FLAG \
 	    --address "$$TEMPORAL_ADDRESS" \
 	    --namespace "$$TEMPORAL_NAMESPACE" \
 	    --api-key "$$API_KEY_VAL"; \
 	else \
 	  $(TEMPORAL) workflow start --type "HelloWorld" --task-queue "default/helloworld" \
+	    $$VERSIONING_FLAG \
 	    --tls-cert-path certs/client.pem \
 	    --tls-key-path certs/client.key \
 	    --address "$$TEMPORAL_ADDRESS" \

@@ -1,0 +1,107 @@
+---
+# ServiceAccount for traffic generator
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: traffic-generator
+  namespace: default
+
+---
+# ClusterRole for traffic generator to read TemporalConnection secrets
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: traffic-generator
+rules:
+  # Read TemporalConnection resources
+  - apiGroups: ["temporal.io"]
+    resources: ["temporalconnections"]
+    verbs: ["get", "list"]
+  # Read secrets for connection info
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list"]
+
+---
+# ClusterRoleBinding for traffic generator
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: traffic-generator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: traffic-generator
+subjects:
+  - kind: ServiceAccount
+    name: traffic-generator
+    namespace: default
+
+---
+# CronJob for continuous traffic generation
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: traffic-generator
+  namespace: default
+spec:
+  # Run every minute at a low rate (adjust schedule as needed)
+  # Examples:
+  #   "*/1 * * * *"    = every 1 minute
+  #   "*/2 * * * *"    = every 2 minutes
+  #   "*/5 * * * *"    = every 5 minutes
+  schedule: "*/2 * * * *"
+  
+  concurrencyPolicy: Forbid
+  
+  # Keep 1 successful and 1 failed job for debugging
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  
+  # Start job up to 10 seconds late (handles scheduler delays)
+  startingDeadlineSeconds: 10
+  
+  jobTemplate:
+    spec:
+      # Retry policy
+      backoffLimit: 2
+      
+      # Job timeout
+      ttlSecondsAfterFinished: 3600
+      
+      template:
+        metadata:
+          labels:
+            app: traffic-generator
+            cronjob: "true"
+        spec:
+          serviceAccountName: traffic-generator
+          restartPolicy: OnFailure
+          
+          containers:
+          - name: traffic-generator
+            # Custom traffic generator image with Temporal CLI
+            image: 025066239481.dkr.ecr.us-east-2.amazonaws.com/traffic-generator:910e14b-20260428100845
+            imagePullPolicy: IfNotPresent
+            
+            env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: TEMPORAL_NAMESPACE
+              value: "default"
+            - name: TEMPORAL_ADDRESS
+              value: "temporal:7233"
+            - name: TASK_QUEUE
+              value: "default/helloworld"
+            - name: WORKFLOWS_PER_RUN
+              value: "3"
+            
+            resources:
+              requests:
+                cpu: 100m
+                memory: 128Mi
+              limits:
+                cpu: 200m
+                memory: 256Mi

@@ -1,0 +1,17 @@
+FROM alpine:latest
+
+# Install necessary tools
+RUN apk add --no-cache ca-certificates bash curl
+
+# Download and install Temporal CLI
+RUN mkdir -p /usr/local/bin && \
+    curl -sSL https://github.com/temporalio/cli/releases/latest/download/temporal-linux-amd64 -o /usr/local/bin/temporal && \
+    chmod +x /usr/local/bin/temporal
+
+# Copy traffic generation script
+COPY internal/demo/scripts/generate-traffic.sh /scripts/generate-traffic.sh
+RUN chmod +x /scripts/generate-traffic.sh
+
+WORKDIR /app
+
+ENTRYPOINT ["/scripts/generate-traffic.sh"]

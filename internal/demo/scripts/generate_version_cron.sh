@@ -144,6 +144,14 @@ if [ "$IS_EKS_CONTEXT" = "1" ] && [ -z "$DEPLOY_REPO" ]; then
   echo "[$TIMESTAMP] EKS context detected; using ECR repo: $DEPLOY_REPO"
 fi
 
+if [ -z "$DEPLOY_REPO" ] && [ -n "${AWS_REGION:-}" ] && command -v aws >/dev/null 2>&1; then
+  AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)
+  if [ -n "$AWS_ACCOUNT_ID" ] && [ "$AWS_ACCOUNT_ID" != "None" ]; then
+    DEPLOY_REPO="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+    echo "[$TIMESTAMP] Derived ECR repo from AWS identity: $DEPLOY_REPO"
+  fi
+fi
+
 if [ -z "$DEPLOY_REPO" ]; then
   # Local/Minikube deployment
   IMAGE_TAG="helloworld:${GIT_COMMIT_SHA}"
