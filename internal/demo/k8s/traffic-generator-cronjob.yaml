@@ -90,13 +90,18 @@ spec:
                 fieldRef:
                   fieldPath: metadata.namespace
             - name: TEMPORAL_NAMESPACE
-              value: "default"
+              value: "quickstart-shashwat-learning.x72yu"
             - name: TEMPORAL_ADDRESS
-              value: "temporal:7233"
-            - name: TASK_QUEUE
+              value: "ap-northeast-1.aws.api.temporal.io:7233"
+            - name: TEMPORAL_TASK_QUEUE
               value: "default/helloworld"
             - name: WORKFLOWS_PER_RUN
               value: "3"
+            - name: TEMPORAL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: temporal-api-key
+                  key: api-key
             
             resources:
               requests:

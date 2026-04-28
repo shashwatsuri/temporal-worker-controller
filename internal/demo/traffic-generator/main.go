@@ -8,9 +8,9 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/temporalio/temporal-worker-controller/internal/demo/util"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/workflow"
-	"go.temporal.io/sdk/activity"
 )
 
 // Workflow function (stub for traffic generation)
@@ -35,17 +35,15 @@ func GeneratedActivity(ctx context.Context, name string) (string, error) {
 
 func main() {
 	// Configuration from environment
-	temporalAddress := os.Getenv("TEMPORAL_ADDRESS")
-	if temporalAddress == "" {
-		temporalAddress = "temporal:7233"
-	}
-
 	namespace := os.Getenv("TEMPORAL_NAMESPACE")
 	if namespace == "" {
 		namespace = "default"
 	}
 
-	taskQueue := os.Getenv("TASK_QUEUE")
+	taskQueue := os.Getenv("TEMPORAL_TASK_QUEUE")
+	if taskQueue == "" {
+		taskQueue = os.Getenv("TASK_QUEUE")
+	}
 	if taskQueue == "" {
 		taskQueue = "default/helloworld"
 	}
@@ -59,17 +57,13 @@ func main() {
 
 	ctx := context.Background()
 
-	// Connect to Temporal server
-	c, err := client.Dial(client.Options{
-		HostPort: temporalAddress,
-	})
-	if err != nil {
-		log.Fatalf("Failed to connect to Temporal server at %s: %v", temporalAddress, err)
-	}
-	defer c.Close()
+	// Use the shared demo client bootstrap. It supports Temporal Cloud auth via env
+	// (API key / mTLS) and keeps connection behavior consistent with other demo workers.
+	c, stopFunc := util.NewClient("traffic-generator", taskQueue, namespace, 9091)
+	defer stopFunc()
 
 	// Create client for starting workflows
-	log.Printf("Connected to Temporal at %s, starting %d workflows to %s", temporalAddress, workflowsPerRun, taskQueue)
+	log.Printf("Connected to Temporal namespace %s, starting %d workflows to %s", namespace, workflowsPerRun, taskQueue)
 
 	timestamp := time.Now().Unix()
 	hostname, _ := os.Hostname()
