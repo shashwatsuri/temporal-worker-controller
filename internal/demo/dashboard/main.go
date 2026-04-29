@@ -187,6 +187,19 @@ type temporalAccessConfigCache struct {
 
 var configCache temporalAccessConfigCache
 
+// stateCache caches the full /api/state response so that rapid browser polls
+// (every 3s) don't each spawn a new batch of kubectl+temporal subprocesses.
+type stateCacheEntry struct {
+	mu      sync.Mutex
+	state   *apiState
+	updated time.Time
+	inflight bool
+}
+
+var stateCache stateCacheEntry
+
+const stateCacheTTL = 5 * time.Second
+
 func main() {
 	var (
 		namespace = flag.String("namespace", "default", "Kubernetes namespace for the TemporalWorkerDeployment")
@@ -202,12 +215,43 @@ func main() {
 	}
 	mux.Handle("/", http.FileServer(http.FS(staticSub)))
 	mux.HandleFunc("/api/state", func(w http.ResponseWriter, r *http.Request) {
-		// Use longer timeout to accommodate Temporal CLI calls which can take time on EKS
-		// Each individual command gets 15-20 sec timeout, so 75 sec total allows for 3-4 commands
+		w.Header().Set("Content-Type", "application/json")
+
+		// Serve from cache if fresh — prevents concurrent 3s browser polls from
+		// each spawning kubectl+temporal subprocesses.
+		stateCache.mu.Lock()
+		if stateCache.state != nil && time.Since(stateCache.updated) < stateCacheTTL {
+			cached := *stateCache.state
+			stateCache.mu.Unlock()
+			_ = json.NewEncoder(w).Encode(cached)
+			return
+		}
+		// Only one goroutine refreshes at a time; others wait and share the result.
+		if stateCache.inflight {
+			var cached *apiState
+			for {
+				stateCache.mu.Unlock()
+				time.Sleep(200 * time.Millisecond)
+				stateCache.mu.Lock()
+				if !stateCache.inflight {
+					cached = stateCache.state
+					break
+				}
+			}
+			stateCache.mu.Unlock()
+			if cached != nil {
+				_ = json.NewEncoder(w).Encode(*cached)
+			}
+			return
+		}
+		stateCache.inflight = true
+		stateCache.mu.Unlock()
+
 		ctx, cancel := context.WithTimeout(r.Context(), 75*time.Second)
 		defer cancel()
 
-		state, err := collectState(ctx, *namespace, *name)
+		var state apiState
+		s, err := collectState(ctx, *namespace, *name)
 		if err != nil {
 			state = apiState{
 				Name:      *name,
@@ -215,9 +259,16 @@ func main() {
 				FetchedAt: time.Now().UTC(),
 				Error:     err.Error(),
 			}
+		} else {
+			state = s
 		}
 
-		w.Header().Set("Content-Type", "application/json")
+		stateCache.mu.Lock()
+		stateCache.state = &state
+		stateCache.updated = time.Now()
+		stateCache.inflight = false
+		stateCache.mu.Unlock()
+
 		_ = json.NewEncoder(w).Encode(state)
 	})
 
@@ -619,16 +670,31 @@ func mergeLiveDeploymentData(ctx context.Context, namespace, twdName string, car
 		}
 		depRef := fmt.Sprintf("%s/%s", depNS, dep.Metadata.Name)
 
-		if idx, ok := cardByBuildID[buildID]; ok {
+		// The deployment label may have a suffix appended to the SHA (e.g. "<sha>-<hex>").
+		// Try matching with the full label first, then fall back to the bare SHA prefix
+		// so we can merge with TWD status cards which use only the SHA.
+		lookupID := buildID
+		if idx, ok := cardByBuildID[lookupID]; ok {
 			cards[idx].Deployment = depRef
 			cards[idx].Replicas = dep.Status.Replicas
 			cards[idx].ReadyReplicas = dep.Status.ReadyReplicas
 			continue
 		}
+		// Strip trailing "-<hex>" suffix if present.
+		if dashIdx := strings.LastIndex(buildID, "-"); dashIdx > 0 {
+			lookupID = buildID[:dashIdx]
+			if idx, ok := cardByBuildID[lookupID]; ok {
+				cards[idx].Deployment = depRef
+				cards[idx].Replicas = dep.Status.Replicas
+				cards[idx].ReadyReplicas = dep.Status.ReadyReplicas
+				cardByBuildID[buildID] = idx // also index the full label
+				continue
+			}
+		}
 
 		cardByBuildID[buildID] = len(cards)
 		cards = append(cards, versionCard{
-			BuildID:       buildID,
+			BuildID:       lookupID, // use bare SHA, not the suffixed label
 			Role:          "discovered",
 			Status:        "Starting",
 			Deployment:    depRef,

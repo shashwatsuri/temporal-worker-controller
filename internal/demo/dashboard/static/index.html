@@ -264,7 +264,19 @@
     const statusEl = document.getElementById("statusMsg");
     const versionsEl = document.getElementById("versions");
     // Keep versions visible across refreshes until their active workload reaches 0.
-    const retainedVersions = new Map();
+    // Backed by sessionStorage so a page refresh doesn't lose the retained state.
+    const RETAINED_KEY = "retainedVersions";
+    function loadRetained() {
+      try {
+        const raw = sessionStorage.getItem(RETAINED_KEY);
+        if (raw) return new Map(JSON.parse(raw));
+      } catch (_) {}
+      return new Map();
+    }
+    function saveRetained(map) {
+      try { sessionStorage.setItem(RETAINED_KEY, JSON.stringify([...map])); } catch (_) {}
+    }
+    const retainedVersions = loadRetained();
 
     function fmtPct(v) {
       if (typeof v !== "number") return "n/a";
@@ -430,7 +442,8 @@
         // Drop entries once active workload is known to be zero.
         retainedVersions.delete(buildId);
       }
-      let knownActiveCount = 0;
+      // Persist retained state so a page refresh doesn't lose draining version history.
+      saveRetained(retainedVersions);
       if (activeTotal !== null) {
         for (const v of visibleVersions) {
           if (typeof v.activeWorkflowCount === "number" && v.activeWorkflowCount >= 0) {
@@ -509,7 +522,7 @@
     }
 
     refresh();
-    setInterval(refresh, 3000);
+    setInterval(refresh, 15000);
   </script>
 </body>
 </html>
