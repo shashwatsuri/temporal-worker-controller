@@ -1,190 +1,150 @@
 #!/bin/sh
-# Multi-architecture image build using Kaniko, invoked from CronJob pod.
-# This script builds linux/amd64 and linux/arm64 images and publishes a manifest list to ECR.
+# Builds a helloworld worker image by launching a Kaniko Kubernetes Job.
+# The demo runner pod (Alpine) creates the Job via kubectl and waits for it.
+# Kaniko runs as PID 1 in its own container — not as a subprocess — avoiding
+# the filesystem-clobbering issue that occurs when running it inline in Alpine.
 #
-# Usage: sh build_version_kaniko.sh IMAGE_TAG [CONTEXT_DIR] [DOCKERFILE]
-#   IMAGE_TAG      Full ECR image tag (e.g., 025066239481.dkr.ecr.us-east-2.amazonaws.com/helloworld:SHA)
-#   CONTEXT_DIR    Path to build context (default: internal/demo)
-#   DOCKERFILE     Dockerfile path within context (default: Dockerfile)
+# Usage: sh build_version_kaniko.sh IMAGE_TAG GIT_REPO_URL GIT_COMMIT_SHA
+#   IMAGE_TAG       Full ECR image tag (e.g., 025066239481.dkr.ecr.us-east-2.amazonaws.com/helloworld:SHA)
+#   GIT_REPO_URL    Git repo URL (e.g., https://github.com/org/repo)
+#   GIT_COMMIT_SHA  Git commit SHA that has the mutated worker.go baked in
 #
 # Environment:
-#   AWS_REGION           AWS region for ECR (auto-detected from image URI or context)
-#   KANIKO_EXECUTOR      Path to kaniko-executor binary (default: /kaniko/executor)
-#   WORKER               Worker name for build args (default: helloworld)
-#   DD_GIT_COMMIT_SHA    Datadog git commit SHA for build args
-#   DD_GIT_REPOSITORY_URL Repository URL for build args
-#
-# This script:
-# 1. Extracts ECR repo, image name, and tag from IMAGE_TAG
-# 2. Builds linux/amd64 image -> pushes as IMAGE_TAG-amd64
-# 3. Builds linux/arm64 image -> pushes as IMAGE_TAG-arm64
-# 4. Creates manifest list combining both architectures
-# 5. Tags manifest list with original IMAGE_TAG
-# 6. Pushes manifest list to ECR
+#   NAMESPACE       Kubernetes namespace (default: default)
+#   WORKER          Worker name for build args (default: helloworld)
+#   AWS_REGION      AWS region for ECR (auto-detected from image URI)
+#   BUILD_TIMEOUT   Seconds to wait for Job completion (default: 900)
 
 set -eu
 
 TIMESTAMP=$(date '+%H:%M:%S')
 
-# Parse arguments
 IMAGE_TAG="${1:-}"
-CONTEXT_DIR="${2:-internal/demo}"
-DOCKERFILE="${3:-Dockerfile}"
-KANIKO_EXECUTOR="${KANIKO_EXECUTOR:-/kaniko/executor}"
+GIT_REPO_URL="${2:-}"
+GIT_COMMIT_SHA="${3:-}"
+NAMESPACE="${NAMESPACE:-default}"
 WORKER="${WORKER:-helloworld}"
+BUILD_TIMEOUT="${BUILD_TIMEOUT:-900}"
 
-if [ -z "$IMAGE_TAG" ]; then
-  echo "[$TIMESTAMP] ERROR: IMAGE_TAG required"
+if [ -z "$IMAGE_TAG" ] || [ -z "$GIT_REPO_URL" ] || [ -z "$GIT_COMMIT_SHA" ]; then
+  echo "[$TIMESTAMP] ERROR: Usage: build_version_kaniko.sh IMAGE_TAG GIT_REPO_URL GIT_COMMIT_SHA"
   exit 1
 fi
 
-echo "[$TIMESTAMP] Starting multi-arch build for $IMAGE_TAG"
-echo "[$TIMESTAMP] Context: $CONTEXT_DIR, Dockerfile: $DOCKERFILE"
+echo "[$TIMESTAMP] Building $IMAGE_TAG from $GIT_REPO_URL@$GIT_COMMIT_SHA"
 
-# Parse image URI
-if ! echo "$IMAGE_TAG" | grep -q ":"; then
-  echo "[$TIMESTAMP] ERROR: IMAGE_TAG must include tag (e.g., repo/image:tag)"
-  exit 1
-fi
+# Extract AWS region from ECR URI
+AWS_REGION=$(echo "$IMAGE_TAG" | sed -n 's#.*\.ecr\.\([a-z0-9-]*\)\.amazonaws\.com.*#\1#p')
+AWS_REGION="${AWS_REGION:-us-east-2}"
+ECR_REGISTRY=$(echo "$IMAGE_TAG" | cut -d/ -f1)
 
-# If IMAGE_TAG is not a full ECR reference (e.g., helloworld:sha),
-# normalize it to ACCOUNT.dkr.ecr.REGION.amazonaws.com/helloworld:sha.
-if ! echo "$IMAGE_TAG" | grep -q '\.dkr\.ecr\.'; then
-  EFFECTIVE_REGION="${AWS_REGION:-us-east-2}"
-  AWS_ACCOUNT_ID=""
-  if command -v aws >/dev/null 2>&1; then
-    AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)
-  fi
-
-  if [ -z "$AWS_ACCOUNT_ID" ] || [ "$AWS_ACCOUNT_ID" = "None" ]; then
-    if [ -n "${AWS_ROLE_ARN:-}" ]; then
-      AWS_ACCOUNT_ID=$(echo "$AWS_ROLE_ARN" | cut -d: -f5)
-    fi
-  fi
-
-  if [ -z "$AWS_ACCOUNT_ID" ] || [ "$AWS_ACCOUNT_ID" = "None" ]; then
-    echo "[$TIMESTAMP] ERROR: IMAGE_TAG is not a full ECR reference and AWS account ID could not be detected"
-    exit 1
-  fi
-
-  IMAGE_TAG="${AWS_ACCOUNT_ID}.dkr.ecr.${EFFECTIVE_REGION}.amazonaws.com/${IMAGE_TAG}"
-  echo "[$TIMESTAMP] Normalized IMAGE_TAG to full ECR reference: $IMAGE_TAG"
-fi
-
-# Extract ECR repo, image name, tag
-# Format: ACCOUNT.dkr.ecr.REGION.amazonaws.com/IMAGE:TAG
-IMAGE_TAG_WITHOUT_SUFFIX=$(echo "$IMAGE_TAG" | cut -d: -f1)
-TAG=$(echo "$IMAGE_TAG" | cut -d: -f2)
-IMAGE_NAME=$(echo "$IMAGE_TAG_WITHOUT_SUFFIX" | sed 's|.*/||')
-ECR_REPO="${IMAGE_TAG_WITHOUT_SUFFIX%/*}"
-
-# Extract AWS region from ECR URI if present
-PARSED_AWS_REGION=$(echo "$ECR_REPO" | sed -n 's#.*\.ecr\.\([a-z0-9-][a-z0-9-]*\)\.amazonaws\.com.*#\1#p')
-AWS_REGION="${PARSED_AWS_REGION:-${AWS_REGION:-us-east-2}}"
-if [ -z "$PARSED_AWS_REGION" ]; then
-  echo "[$TIMESTAMP] WARNING: Could not detect AWS_REGION from ECR URI, using $AWS_REGION"
-fi
-
-if ! echo "$ECR_REPO" | grep -q '\.dkr\.ecr\.'; then
-  echo "[$TIMESTAMP] ERROR: IMAGE_TAG must be a full ECR image reference, got $IMAGE_TAG"
-  exit 1
-fi
-
-echo "[$TIMESTAMP] ECR Repo: $ECR_REPO"
-echo "[$TIMESTAMP] Image Name: $IMAGE_NAME, Tag: $TAG"
-echo "[$TIMESTAMP] AWS Region: $AWS_REGION"
-
-# 1. Get ECR login token (assumes IRSA provides AWS credentials)
+# Get ECR auth token to pass to Kaniko via a K8s Secret
 echo "[$TIMESTAMP] Getting ECR login token..."
-if ! command -v aws >/dev/null 2>&1; then
-  echo "[$TIMESTAMP] ERROR: aws CLI not found - required for ECR authentication"
-  exit 1
-fi
-
-ECR_TOKEN=$(aws ecr get-authorization-token --region "$AWS_REGION" --output text --query 'authorizationData[0].authorizationToken' 2>/dev/null || true)
+ECR_TOKEN=$(aws ecr get-authorization-token \
+  --region "$AWS_REGION" \
+  --output text \
+  --query 'authorizationData[0].authorizationToken' 2>/dev/null || true)
 if [ -z "$ECR_TOKEN" ]; then
   echo "[$TIMESTAMP] ERROR: Failed to obtain ECR login token - check IRSA permissions"
   exit 1
 fi
 
-# Decode token to extract username:password
-ECR_USER=$(echo "$ECR_TOKEN" | base64 -d | cut -d: -f1)
-ECR_PASS=$(echo "$ECR_TOKEN" | base64 -d | cut -d: -f2)
-ECR_REGISTRY=$(echo "$ECR_REPO" | cut -d/ -f1)
+# Build docker config JSON for Kaniko's /kaniko/.docker/config.json
+DOCKER_CONFIG_JSON=$(printf '{"auths":{"%s":{"auth":"%s"}}}' "$ECR_REGISTRY" "$ECR_TOKEN")
 
-echo "[$TIMESTAMP] ECR registry: $ECR_REGISTRY"
+# Unique names based on short SHA
+SHORT_SHA=$(echo "$GIT_COMMIT_SHA" | cut -c1-8)
+JOB_NAME="kaniko-build-${SHORT_SHA}"
+SECRET_NAME="kaniko-ecr-${SHORT_SHA}"
 
-# 2. Build architecture-specific images using Kaniko
-# For each architecture, Kaniko pushes directly to ECR with -amd64/-arm64 suffix
+# Clean up any previous run with the same SHA
+kubectl delete job "$JOB_NAME" -n "$NAMESPACE" --ignore-not-found 2>/dev/null || true
+kubectl delete secret "$SECRET_NAME" -n "$NAMESPACE" --ignore-not-found 2>/dev/null || true
 
-for ARCH in amd64 arm64; do
-  ARCH_TAG="${ECR_REPO}/${IMAGE_NAME}:${TAG}-${ARCH}"
-  echo "[$TIMESTAMP] [$ARCH] Building: $ARCH_TAG"
-  
-  # Determine GOARCH for build args
-  GOARCH="$ARCH"
-  
-  # Kaniko executor invocation
-  # Note: This assumes the pod has /kaniko/executor binary and source mounted
-  $KANIKO_EXECUTOR \
-    --context="." \
-    --dockerfile="$DOCKERFILE" \
-    --destination="$ARCH_TAG" \
-    --snapshot-mode=redo \
-    --build-arg="WORKER=$WORKER" \
-    --build-arg="DD_GIT_COMMIT_SHA=${DD_GIT_COMMIT_SHA:-unknown}" \
-    --build-arg="DD_GIT_REPOSITORY_URL=${DD_GIT_REPOSITORY_URL:-}" \
-    --build-arg="GOARCH=$GOARCH" \
-    --registry-mirror="$ECR_REGISTRY" \
-    --verbosity=info \
-    2>&1 | tee "/tmp/kaniko-${ARCH}.log" || {
-      echo "[$TIMESTAMP] ERROR: Kaniko build failed for $ARCH"
-      tail -50 "/tmp/kaniko-${ARCH}.log"
-      exit 1
-    }
-  
-  echo "[$TIMESTAMP] [$ARCH] Pushed: $ARCH_TAG"
-done
+echo "[$TIMESTAMP] Creating ECR credentials secret: $SECRET_NAME"
+kubectl create secret generic "$SECRET_NAME" \
+  --namespace="$NAMESPACE" \
+  --from-literal=config.json="$DOCKER_CONFIG_JSON"
 
-# 3. Create and push manifest list
-echo "[$TIMESTAMP] Creating manifest list for $IMAGE_TAG"
+# Detect native node architecture so we build the right binary
+NODE_ARCH=$(kubectl get nodes -o jsonpath='{.items[0].status.nodeInfo.architecture}' 2>/dev/null || echo "amd64")
+echo "[$TIMESTAMP] Cluster node architecture: $NODE_ARCH"
 
-if ! command -v docker >/dev/null 2>&1; then
-  # Fallback: use aws ecr batch-get-image or other ECR APIs to construct manifest
-  echo "[$TIMESTAMP] WARNING: docker not available, attempting manifest creation via ECR API"
-  # This would require more complex logic; for MVP assume docker is available in pod
-else
-  # Use docker to create and push manifest list
-  echo "[$TIMESTAMP] Logging into ECR via docker..."
-  echo "$ECR_PASS" | docker login -u "$ECR_USER" --password-stdin "$ECR_REGISTRY" 2>/dev/null || true
-  
-  # Pull the arch-specific images to inspect digests
-  echo "[$TIMESTAMP] Pulling architecture images..."
-  docker pull "${ECR_REPO}/${IMAGE_NAME}:${TAG}-amd64" 2>/dev/null || true
-  docker pull "${ECR_REPO}/${IMAGE_NAME}:${TAG}-arm64" 2>/dev/null || true
-  
-  # Create manifest list (this is a newer docker feature, may not be available in older versions)
-  echo "[$TIMESTAMP] Creating manifest list..."
-  docker manifest create "$IMAGE_TAG" \
-    "${ECR_REPO}/${IMAGE_NAME}:${TAG}-amd64" \
-    "${ECR_REPO}/${IMAGE_NAME}:${TAG}-arm64" || {
-      echo "[$TIMESTAMP] WARNING: docker manifest create failed - trying skopeo or direct ECR manifest"
-      # Fallback: use buildctl, skopeo, or manual ECR manifest update
-      # For MVP, assume docker manifest works
-      exit 1
-    }
-  
-  # Annotate manifest entries with architecture
-  docker manifest annotate "$IMAGE_TAG" "${ECR_REPO}/${IMAGE_NAME}:${TAG}-amd64" --arch amd64 || true
-  docker manifest annotate "$IMAGE_TAG" "${ECR_REPO}/${IMAGE_NAME}:${TAG}-arm64" --arch arm64 || true
-  
-  # Push manifest list
-  echo "[$TIMESTAMP] Pushing manifest list to ECR..."
-  docker manifest push "$IMAGE_TAG" 2>&1 | grep -v "using default tag version" || true
+# Use Kaniko's git:// context — it clones the repo at the exact SHA so that
+# --context-sub-path resolves correctly (GitHub tarballs unpack as <repo>-<sha>/
+# which breaks sub-path resolution).
+CONTEXT_URL="git://${GIT_REPO_URL#https://}#${GIT_COMMIT_SHA}"
+echo "[$TIMESTAMP] Kaniko context: $CONTEXT_URL"
+
+echo "[$TIMESTAMP] Creating Kaniko Job: $JOB_NAME"
+kubectl apply -f - <<EOF
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${JOB_NAME}
+  namespace: ${NAMESPACE}
+  labels:
+    app: kaniko-build
+    version-sha: ${SHORT_SHA}
+spec:
+  ttlSecondsAfterFinished: 600
+  backoffLimit: 0
+  template:
+    metadata:
+      annotations:
+        karpenter.sh/do-not-disrupt: "true"
+    spec:
+      serviceAccountName: rainbow-demo-runner
+      restartPolicy: Never
+      containers:
+        - name: kaniko
+          image: gcr.io/kaniko-project/executor:latest
+          args:
+            - "--context=${CONTEXT_URL}"
+            - "--context-sub-path=internal/demo"
+            - "--dockerfile=Dockerfile"
+            - "--destination=${IMAGE_TAG}"
+            - "--snapshot-mode=redo"
+            - "--compressed-caching=false"
+            - "--custom-platform=linux/${NODE_ARCH}"
+            - "--build-arg=WORKER=${WORKER}"
+            - "--build-arg=GOARCH=${NODE_ARCH}"
+            - "--build-arg=DD_GIT_COMMIT_SHA=${GIT_COMMIT_SHA}"
+            - "--verbosity=info"
+          volumeMounts:
+            - name: docker-config
+              mountPath: /kaniko/.docker
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: 2000m
+              memory: 3Gi
+      volumes:
+        - name: docker-config
+          secret:
+            secretName: ${SECRET_NAME}
+            items:
+              - key: config.json
+                path: config.json
+EOF
+
+echo "[$TIMESTAMP] Waiting up to ${BUILD_TIMEOUT}s for Job $JOB_NAME..."
+if ! kubectl wait job/"$JOB_NAME" \
+    --namespace="$NAMESPACE" \
+    --for=condition=complete \
+    --timeout="${BUILD_TIMEOUT}s" 2>/dev/null; then
+  echo "[$TIMESTAMP] ERROR: Kaniko Job failed or timed out - fetching logs"
+  kubectl logs -n "$NAMESPACE" "job/$JOB_NAME" --tail=100 2>/dev/null || true
+  kubectl delete job "$JOB_NAME" -n "$NAMESPACE" --ignore-not-found 2>/dev/null || true
+  kubectl delete secret "$SECRET_NAME" -n "$NAMESPACE" --ignore-not-found 2>/dev/null || true
+  exit 1
 fi
 
-echo "[$TIMESTAMP] Multi-arch build complete: $IMAGE_TAG"
-echo "[$TIMESTAMP] Architecture-specific tags:"
-echo "[$TIMESTAMP]   amd64: ${ECR_REPO}/${IMAGE_NAME}:${TAG}-amd64"
-echo "[$TIMESTAMP]   arm64: ${ECR_REPO}/${IMAGE_NAME}:${TAG}-arm64"
-echo "[$TIMESTAMP] Manifest list: $IMAGE_TAG"
+echo "[$TIMESTAMP] Build succeeded. Log tail:"
+kubectl logs -n "$NAMESPACE" "job/$JOB_NAME" --tail=10 2>/dev/null || true
+
+kubectl delete secret "$SECRET_NAME" -n "$NAMESPACE" --ignore-not-found 2>/dev/null || true
+
+echo "[$TIMESTAMP] Build complete: $IMAGE_TAG"
