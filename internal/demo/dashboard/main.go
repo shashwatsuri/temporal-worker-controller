@@ -554,9 +554,12 @@ func shouldQueryActiveWorkflowCount(card versionCard) bool {
 	if status == "ramping" || status == "draining" || status == "current" {
 		return true
 	}
-	if card.ReadyReplicas > 0 {
-		return true
-	}
+	// Deliberately omit a ReadyReplicas > 0 fallback: stale K8s deployments for
+	// deprecated/inactive versions still have running pods but their workflows are
+	// attributed to whichever version IDs actually executed them.
+	// TemporalWorkerDeploymentVersion is a keyword-list attribute, so "=" means
+	// "contains", and the same workflow would be counted for every version that
+	// ever ran it — producing inflated double-counts across all stale replicas.
 	return false
 }
 
