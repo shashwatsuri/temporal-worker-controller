@@ -42,7 +42,7 @@ profiles:
             setValues:
               image.repository: temporal-worker-controller
               image.tag: latest
-              image.pullPolicy: IfNotPresent
+              image.pullPolicy: Always
               namespace.create: true
               certmanager.install: false
             valuesFiles:
@@ -155,7 +155,7 @@ deploy:
               - "kubectl annotate crd temporalconnections.temporal.io temporalworkerdeployments.temporal.io workerresourcetemplates.temporal.io meta.helm.sh/release-name=temporal-worker-controller-crds meta.helm.sh/release-namespace=temporal-system --overwrite 2>/dev/null || true"
       after:
         - host:
-            command: ["sh", "-c", "sed -i '' 's/appVersion: .*/appVersion: \"automated\"/' internal/demo/helloworld/helm/helloworld/Chart.yaml"]
+            command: ["sh", "-c", "sed -i \"s/^appVersion: .*/appVersion: \\\"automated\\\"/\" internal/demo/helloworld/helm/helloworld/Chart.yaml"]
 resourceSelector:
   allow:
     - groupKind: "TemporalWorkerDeployment.temporal.io"
