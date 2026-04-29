@@ -444,6 +444,7 @@
       }
       // Persist retained state so a page refresh doesn't lose draining version history.
       saveRetained(retainedVersions);
+      let knownActiveCount = 0;
       if (activeTotal !== null) {
         for (const v of visibleVersions) {
           if (typeof v.activeWorkflowCount === "number" && v.activeWorkflowCount >= 0) {
