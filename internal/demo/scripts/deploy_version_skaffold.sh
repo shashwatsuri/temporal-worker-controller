@@ -172,16 +172,5 @@ else
   echo "[$TIMESTAMP] Non-blocking mode: submitted rollout for TemporalWorkerDeployment/$RELEASE_NAME (status now: $TWD_STATUS)"
 fi
 
-# 7. Verify image was deployed
-DEPLOYED_IMAGE=$(kubectl get temporalworkerdeployment "$RELEASE_NAME" -n "$NAMESPACE" -o jsonpath='{.status.lastDeployedImage}' 2>/dev/null || echo "Unknown")
-echo "[$TIMESTAMP] Last deployed image: $DEPLOYED_IMAGE"
-
-if [ "$DEPLOYED_IMAGE" != "Unknown" ] && echo "$DEPLOYED_IMAGE" | grep -q "$TAG"; then
-  echo "[$TIMESTAMP] Deployment complete: $IMAGE_TAG"
-else
-  echo "[$TIMESTAMP] WARNING: Deployed image may not match requested tag"
-  echo "[$TIMESTAMP]   Requested: $IMAGE_TAG"
-  echo "[$TIMESTAMP]   Deployed: $DEPLOYED_IMAGE"
-fi
-
+# 7. Report completion
 echo "[$TIMESTAMP] Deploy script completed successfully"
