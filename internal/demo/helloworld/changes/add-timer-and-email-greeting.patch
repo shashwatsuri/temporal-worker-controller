@@ -1,0 +1,17 @@
+--- a/internal/demo/helloworld/worker.go
++++ b/internal/demo/helloworld/worker.go
+@@ -24,8 +24,13 @@
+ 		return "", err
+ 	}
+ 
++	// Non-replay-safe demo change: introduces a timer command in workflow history.
++	if err := workflow.Sleep(ctx, 10*time.Second); err != nil {
++		return "", err
++	}
++
+ 	// Return the greeting
+-	return fmt.Sprintf("Hello %s", subject), nil
++	return fmt.Sprintf("Hello %s (time-gated)", subject), nil
+ }
+ 
+ func GetSubject(ctx context.Context) (string, error) {

@@ -16,7 +16,7 @@ import (
 )
 
 func HelloWorld(ctx workflow.Context) (string, error) {
-	ctx = util.SetActivityTimeout(ctx, 5*time.Minute)
+	ctx = util.SetActivityTimeout(ctx, 12*time.Minute)
 
 	// Get a subject
 	var subject string
@@ -24,8 +24,14 @@ func HelloWorld(ctx workflow.Context) (string, error) {
 		return "", err
 	}
 
+
+	// Non-replay-safe change introduced by Rainbow demo v2
+	if err := workflow.Sleep(ctx, 300*time.Second); err != nil {
+		return "", err
+	}
+
 	// Return the greeting
-	return fmt.Sprintf("Hello %s", subject), nil
+	return fmt.Sprintf("Hello %s (rainbow demo v2, sleep=300s)", subject), nil
 }
 
 func GetSubject(ctx context.Context) (string, error) {
@@ -38,7 +44,7 @@ func GetSubject(ctx context.Context) (string, error) {
 func RolloutGate(ctx workflow.Context) error {
 	// Ensure that deploys fail fast rather than waiting forever if child workflow is blocked.
 	ctx = workflow.WithChildOptions(ctx, workflow.ChildWorkflowOptions{
-		WorkflowExecutionTimeout: time.Minute,
+		WorkflowExecutionTimeout: 12*time.Minute,
 	})
 
 	var greeting string

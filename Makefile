@@ -153,7 +153,6 @@ help: ## Display this help.
 manifests: controller-gen ## Generate ClusterRole and CustomResourceDefinition objects.
 	GOWORK=off GO111MODULE=on $(CONTROLLER_GEN) rbac:roleName=manager-role crd:allowDangerousTypes=true,maxDescLen=0,generateEmbeddedObjectMeta=true paths=./api/... paths=./internal/... paths=./cmd/... \
     output:crd:artifacts:config=helm/temporal-worker-controller-crds/templates
-	python3 hack/sync-rbac-rules.py
 
 .PHONY: generate
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
@@ -168,13 +167,23 @@ start-sample-workflow: ## Start a sample workflow.
 	API_KEY_VAL=""; \
 	if [ -n "$$TEMPORAL_API_KEY" ]; then API_KEY_VAL="$$TEMPORAL_API_KEY"; \
 	elif [ -f certs/api-key.txt ]; then API_KEY_VAL="$$(tr -d '\r\n' < certs/api-key.txt)"; fi; \
+	VERSIONING_FLAG=""; \
+	if $(TEMPORAL) workflow start --help 2>/dev/null | grep -q -- "--versioning-override-behavior"; then \
+	  VERSIONING_FLAG="--versioning-override-behavior pinned"; \
+	elif $(TEMPORAL) workflow start --help 2>/dev/null | grep -q -- "--versioning-intent"; then \
+	  VERSIONING_FLAG="--versioning-intent pinned"; \
+	else \
+	  echo "INFO: Temporal CLI does not support pinned start flags; relying on worker default versioning behavior for pinning" >&2; \
+	fi; \
 	if [ -n "$$API_KEY_VAL" ]; then \
 	  $(TEMPORAL) workflow start --type "HelloWorld" --task-queue "default/helloworld" \
+	    $$VERSIONING_FLAG \
 	    --address "$$TEMPORAL_ADDRESS" \
 	    --namespace "$$TEMPORAL_NAMESPACE" \
 	    --api-key "$$API_KEY_VAL"; \
 	else \
 	  $(TEMPORAL) workflow start --type "HelloWorld" --task-queue "default/helloworld" \
+	    $$VERSIONING_FLAG \
 	    --tls-cert-path certs/client.pem \
 	    --tls-key-path certs/client.key \
 	    --address "$$TEMPORAL_ADDRESS" \
@@ -197,6 +206,21 @@ apply-hpa-load: ## Start ~2 workflows/sec to build a backlog and drive HPA scali
 		$(MAKE) -s start-sample-workflow & \
 		sleep 0.5; \
 	done
+
+.PHONY: demo
+.SILENT: demo
+demo: ## Run the full rainbow demo: continuous load + version rolling. Open http://localhost:8787 to watch. Ctrl-C to stop.
+	@echo "Starting rainbow demo..."
+	@echo "  Load:     ~1 workflow/sec (pinned workflows sleep 90-300s)"
+	@echo "  Versions: new version every 90s"
+	@echo "  Dashboard: http://localhost:8787"
+	@echo ""
+	@(while true; do $(MAKE) -s start-sample-workflow; sleep 1; done) & \
+	LOAD_PID=$$!; \
+	(DELAY_SECONDS=90 sh internal/demo/scripts/continuous_versions.sh) & \
+	VERSIONS_PID=$$!; \
+	trap "kill $$LOAD_PID $$VERSIONS_PID 2>/dev/null; exit 0" INT TERM; \
+	wait
 
 .PHONY: list-workflow-build-ids
 list-workflow-build-ids: ## List workflow executions and their build IDs.

@@ -12,6 +12,11 @@
         "tag": {
           "type": "string",
           "description": "Container image tag"
+        },
+        "pullPolicy": {
+          "type": "string",
+          "enum": ["Always", "Never", "IfNotPresent"],
+          "description": "Container image pull policy"
         }
       },
       "required": ["repository", "tag"],

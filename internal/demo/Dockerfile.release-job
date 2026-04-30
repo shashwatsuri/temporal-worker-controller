@@ -1,0 +1,44 @@
+FROM alpine:3.20
+
+ARG TEMPORAL_CLI_VERSION=1.6.2
+ARG TARGETARCH
+
+RUN apk add --no-cache ca-certificates curl docker-cli git jq kubectl aws-cli
+
+RUN set -eux; \
+	arch="${TARGETARCH:-}"; \
+	if [ -z "$arch" ]; then \
+		case "$(apk --print-arch)" in \
+			x86_64) arch="amd64" ;; \
+			aarch64) arch="arm64" ;; \
+			*) echo "unsupported architecture: $(apk --print-arch)"; exit 1 ;; \
+		esac; \
+	fi; \
+	curl -fsSL "https://github.com/temporalio/cli/releases/download/v${TEMPORAL_CLI_VERSION}/temporal_cli_${TEMPORAL_CLI_VERSION}_linux_${arch}.tar.gz" -o /tmp/temporal.tar.gz; \
+	tar -xzf /tmp/temporal.tar.gz -C /usr/local/bin temporal; \
+	rm -f /tmp/temporal.tar.gz; \
+	case "$arch" in \
+		amd64) skaffold_arch="amd64" ;; \
+		arm64) skaffold_arch="arm64" ;; \
+		*) echo "unsupported skaffold architecture: $arch"; exit 1 ;; \
+	esac; \
+	curl -fsSL "https://storage.googleapis.com/skaffold/releases/latest/skaffold-linux-${skaffold_arch}" -o /usr/local/bin/skaffold; \
+	chmod +x /usr/local/bin/skaffold; \
+	chmod +x /usr/local/bin/temporal; \
+	helm_version="3.17.3"; \
+	curl -fsSL "https://get.helm.sh/helm-v${helm_version}-linux-${arch}.tar.gz" -o /tmp/helm.tar.gz; \
+	tar -xzf /tmp/helm.tar.gz -C /usr/local/bin --strip-components=1 "linux-${arch}/helm"; \
+	rm -f /tmp/helm.tar.gz
+
+COPY internal/demo/scripts/demo_loop.sh /opt/release-scripts/demo_loop.sh
+COPY internal/demo/scripts/generate-traffic.sh /opt/release-scripts/generate-traffic.sh
+COPY internal/demo/scripts/generate_version_cron.sh /opt/release-scripts/generate_version_cron.sh
+COPY internal/demo/scripts/build_version_kaniko.sh /opt/release-scripts/build_version_kaniko.sh
+COPY internal/demo/scripts/deploy_version_skaffold.sh /opt/release-scripts/deploy_version_skaffold.sh
+COPY internal/demo/scripts/run_release_once.sh /opt/release-scripts/run_release_once.sh
+
+RUN chmod +x /opt/release-scripts/*.sh
+
+WORKDIR /work
+
+ENTRYPOINT ["/bin/sh"]

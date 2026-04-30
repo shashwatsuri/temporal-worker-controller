@@ -42,7 +42,7 @@ profiles:
             setValues:
               image.repository: temporal-worker-controller
               image.tag: latest
-              image.pullPolicy: IfNotPresent
+              image.pullPolicy: Always
               namespace.create: true
               certmanager.install: false
             valuesFiles:
@@ -76,12 +76,99 @@ profiles:
               temporal.apiKey.key: "{{ .TEMPORAL_API_KEY_SECRET_KEY }}"
             valuesFiles:
               - internal/demo/helloworld/helm/helloworld/values.yaml
+
+  # Build the rainbow dashboard container image
+  - name: dashboard
+    build:
+      artifacts:
+        - image: rainbow-dashboard
+          context: .
+          docker:
+            dockerfile: internal/demo/Dockerfile.dashboard
+
+  - name: rainbow-release
+    build:
+      artifacts:
+        - image: rainbow-release-manager
+          context: internal/demo
+          docker:
+            dockerfile: Dockerfile
+            buildArgs:
+              DD_GIT_COMMIT_SHA: "{{ .IMAGE_TAG }}"
+              DD_GIT_REPOSITORY_URL: "github.com/shashwatsuri/temporal-worker-controller"
+              WORKER: "release"
+        - image: rainbow-release-job
+          context: .
+          docker:
+            dockerfile: internal/demo/Dockerfile.release-job
+    manifests:
+      helm:
+        releases:
+          - name: rainbow-release-manager
+            chartPath: internal/demo/release/helm/release-manager
+            setValueTemplates:
+              manager.image.repository: "{{ .IMAGE_REPO_rainbow_release_manager }}"
+              manager.image.tag: "{{ .IMAGE_TAG_rainbow_release_manager }}"
+              job.image.repository: "{{ .IMAGE_REPO_rainbow_release_job }}"
+              job.image.tag: "{{ .IMAGE_TAG_rainbow_release_job }}"
+              temporal.namespace: "{{ .TEMPORAL_NAMESPACE }}"
+              temporal.address: "{{ .TEMPORAL_ADDRESS }}"
+              temporal.mtlsSecretName: "{{ .TEMPORAL_MTLS_SECRET_NAME }}"
+              temporal.apiKey.name: "{{ .TEMPORAL_API_KEY_SECRET_NAME }}"
+              temporal.apiKey.key: "{{ .TEMPORAL_API_KEY_SECRET_KEY }}"
+            valuesFiles:
+              - internal/demo/release/helm/release-manager/values.yaml
+
+  # Architecture override profile for EKS/x86_64 clusters.
+  # Use in combination with another profile, e.g. --profile worker-controller,eks-amd64
+  - name: eks-amd64
+    build:
+      platforms:
+        - linux/amd64
+
+  # Architecture override profile for EKS/arm64 clusters.
+  # Use in combination with another profile, e.g. --profile worker-controller,eks-arm64
+  - name: eks-arm64
+    build:
+      platforms:
+        - linux/arm64
+
+  # Deploy the demo loop runner that continuously releases new helloworld versions
+  - name: demo-loop-runner
+    build:
+      artifacts:
+        - image: rainbow-release-job
+          context: .
+          docker:
+            dockerfile: internal/demo/Dockerfile.release-job
+    manifests:
+      helm:
+        releases:
+          - name: demo-loop-runner
+            chartPath: internal/demo/k8s/demo-loop-runner
+            setValueTemplates:
+              image.repository: "{{ .IMAGE_REPO_rainbow_release_job }}"
+              image.tag: "{{ .IMAGE_TAG_rainbow_release_job }}"
+              temporal.address: "{{ .TEMPORAL_ADDRESS }}"
+              temporal.namespace: "{{ .TEMPORAL_NAMESPACE }}"
+              temporal.apiKey.secretName: "{{ .TEMPORAL_API_KEY_SECRET_NAME }}"
+              temporal.apiKey.secretKey: "{{ .TEMPORAL_API_KEY_SECRET_KEY }}"
+            setValues:
+              aws.roleArn: arn:aws:iam::025066239481:role/rainbow-version-generator-role
+              aws.region: us-east-2
+              release.name: helloworld
+              release.repoUrl: https://github.com/shashwatsuri/temporal-worker-controller
+              release.repoRef: main
+              release.worker: helloworld
+            valuesFiles:
+              - internal/demo/k8s/demo-loop-runner/values.yaml
+
 deploy:
   helm:
     hooks:
       before:
         - host:
-            command: ["./internal/demo/scripts/update_chart_version.sh"]
+            command: ["sh", "-c", "[ -f ./internal/demo/scripts/update_chart_version.sh ] && ./internal/demo/scripts/update_chart_version.sh || true"]
         # Adopt any existing temporal CRDs into the temporal-worker-controller-crds Helm release.
         # This is a no-op on a fresh cluster (CRDs not found → silently ignored).
         # On a cluster with pre-existing CRDs (e.g. installed via kubectl or an older chart),
@@ -98,7 +185,7 @@ deploy:
               - "kubectl annotate crd temporalconnections.temporal.io temporalworkerdeployments.temporal.io workerresourcetemplates.temporal.io meta.helm.sh/release-name=temporal-worker-controller-crds meta.helm.sh/release-namespace=temporal-system --overwrite 2>/dev/null || true"
       after:
         - host:
-            command: ["sh", "-c", "sed -i '' 's/appVersion: .*/appVersion: \"automated\"/' internal/demo/helloworld/helm/helloworld/Chart.yaml"]
+            command: ["sh", "-c", "sed -i.bak 's/^appVersion: .*/appVersion: \"automated\"/' internal/demo/helloworld/helm/helloworld/Chart.yaml && rm -f internal/demo/helloworld/helm/helloworld/Chart.yaml.bak"]
 resourceSelector:
   allow:
     - groupKind: "TemporalWorkerDeployment.temporal.io"

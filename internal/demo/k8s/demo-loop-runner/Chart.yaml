@@ -1,0 +1,5 @@
+apiVersion: v2
+name: demo-loop-runner
+description: Rainbow demo loop runner for temporal-worker-controller
+version: 0.1.0
+type: application
