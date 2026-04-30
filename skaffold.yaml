@@ -154,7 +154,7 @@ profiles:
               temporal.apiKey.secretName: "{{ .TEMPORAL_API_KEY_SECRET_NAME }}"
               temporal.apiKey.secretKey: "{{ .TEMPORAL_API_KEY_SECRET_KEY }}"
             setValues:
-              aws.roleArn: ""
+              aws.roleArn: arn:aws:iam::025066239481:role/rainbow-version-generator-role
               aws.region: us-east-2
               release.name: helloworld
               release.repoUrl: https://github.com/shashwatsuri/temporal-worker-controller
