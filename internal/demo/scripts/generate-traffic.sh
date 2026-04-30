@@ -10,7 +10,6 @@ TEMPORAL_NAMESPACE="${TEMPORAL_NAMESPACE:-default}"
 WORKFLOW_TYPE="${WORKFLOW_TYPE:-HelloWorld}"
 TEMPORAL_WORKER_DEPLOYMENT="${TEMPORAL_WORKER_DEPLOYMENT:-${NAMESPACE}/helloworld}"
 MAX_RUNNING_WORKFLOWS="${MAX_RUNNING_WORKFLOWS:-10}"
-PINNED_BUILD_ID="${PINNED_BUILD_ID:-}"
 MAX_NEW_WORKFLOWS_PER_RUN="${MAX_NEW_WORKFLOWS_PER_RUN:-5}"
 
 TIMESTAMP=$(date '+%s')
@@ -80,11 +79,6 @@ fi
 
 echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Starting traffic generation: launch=${launch_target}, running=${running_workflows}, max=${MAX_RUNNING_WORKFLOWS}, taskQueue=${TASK_QUEUE}"
 echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Temporal server: $TEMPORAL_ADDRESS, namespace: $TEMPORAL_NAMESPACE"
-if [ -n "$PINNED_BUILD_ID" ]; then
-  echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Pinning workflows to build ID: ${TEMPORAL_WORKER_DEPLOYMENT}:${PINNED_BUILD_ID}"
-else
-  echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] No build ID pinning (PINNED_BUILD_ID not set)"
-fi
 
 # Generate workflows
 SUCCESS_COUNT=0
@@ -98,10 +92,6 @@ for i in $(seq 1 "$launch_target"); do
   
   # Start workflow using temporal CLI
   # Workflow type should be what helloworld worker is listening for
-  VERSIONING_ARGS=""
-  if [ -n "$PINNED_BUILD_ID" ]; then
-    VERSIONING_ARGS="--versioning-override pinned:${TEMPORAL_WORKER_DEPLOYMENT}:${PINNED_BUILD_ID}"
-  fi
   # shellcheck disable=SC2086
   if temporal workflow start \
     --address "$TEMPORAL_ADDRESS" \
@@ -110,7 +100,6 @@ for i in $(seq 1 "$launch_target"); do
     --type "$WORKFLOW_TYPE" \
     --workflow-id "$WORKFLOW_ID" \
     --input '{"name":"traffic-generated"}' \
-    $VERSIONING_ARGS \
     2>&1; then
     echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ✓ Started workflow: $WORKFLOW_ID"
     SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
