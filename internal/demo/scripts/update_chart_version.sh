@@ -13,8 +13,8 @@ fi
 
 if [ $# -gt 0 ]; then
     # Use tag from command line argument if provided
-    perl -pi -e "s/^appVersion: .*/appVersion: \"$1\"/" "$CHART"
+    sed -i.bak "s/^appVersion: .*/appVersion: \"$1\"/" "$CHART" && rm -f "${CHART}.bak"
 else
     GIT_SHA=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
-    perl -pi -e "s/^appVersion: .*/appVersion: \"${GIT_SHA}\"/" "$CHART"
+    sed -i.bak "s/^appVersion: .*/appVersion: \"${GIT_SHA}\"/" "$CHART" && rm -f "${CHART}.bak"
 fi

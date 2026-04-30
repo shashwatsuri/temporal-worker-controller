@@ -185,7 +185,7 @@ deploy:
               - "kubectl annotate crd temporalconnections.temporal.io temporalworkerdeployments.temporal.io workerresourcetemplates.temporal.io meta.helm.sh/release-name=temporal-worker-controller-crds meta.helm.sh/release-namespace=temporal-system --overwrite 2>/dev/null || true"
       after:
         - host:
-            command: ["sh", "-c", "perl -pi -e 's/^appVersion: .*/appVersion: \"automated\"/' internal/demo/helloworld/helm/helloworld/Chart.yaml"]
+            command: ["sh", "-c", "sed -i.bak 's/^appVersion: .*/appVersion: \"automated\"/' internal/demo/helloworld/helm/helloworld/Chart.yaml && rm -f internal/demo/helloworld/helm/helloworld/Chart.yaml.bak"]
 resourceSelector:
   allow:
     - groupKind: "TemporalWorkerDeployment.temporal.io"
