@@ -168,7 +168,7 @@ deploy:
     hooks:
       before:
         - host:
-            command: ["./internal/demo/scripts/update_chart_version.sh"]
+            command: ["sh", "-c", "[ -f ./internal/demo/scripts/update_chart_version.sh ] && ./internal/demo/scripts/update_chart_version.sh || true"]
         # Adopt any existing temporal CRDs into the temporal-worker-controller-crds Helm release.
         # This is a no-op on a fresh cluster (CRDs not found → silently ignored).
         # On a cluster with pre-existing CRDs (e.g. installed via kubectl or an older chart),
