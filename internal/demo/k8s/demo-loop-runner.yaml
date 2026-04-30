@@ -15,10 +15,10 @@ metadata:
   namespace: __NAMESPACE__
 rules:
   - apiGroups: [""]
-    resources: ["configmaps", "pods", "pods/log", "secrets", "services", "serviceaccounts", "nodes"]
+    resources: ["configmaps", "pods", "pods/log", "secrets", "services", "serviceaccounts", "nodes", "events"]
     verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
   - apiGroups: ["apps"]
-    resources: ["deployments"]
+    resources: ["deployments", "statefulsets", "replicasets", "daemonsets"]
     verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
   - apiGroups: ["batch"]
     resources: ["jobs"]
