@@ -11,7 +11,7 @@ spec:
   {{- $apiSecretName := .Values.temporal.apiKey.name | trim }}
   {{- $apiSecretKey := .Values.temporal.apiKey.key | trim }}
   {{- $mtlsName := .Values.temporal.mtlsSecretName | default "" | trim | trimAll "\"" }}
-  {{- if $apiSecretName }}
+  {{- if and $apiSecretName $apiSecretKey }}
   apiKeySecretRef:
     name: {{ $apiSecretName | quote }}
     key: {{ $apiSecretKey | quote }}
@@ -20,5 +20,8 @@ spec:
   mutualTLSSecretRef:
     name: {{ $mtlsName | quote }}
   apiKeySecretRef: null
+  {{- else }}
+  apiKeySecretRef: null
+  mutualTLSSecretRef: null
   {{- end }}
 {{- end }}

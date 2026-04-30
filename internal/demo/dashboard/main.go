@@ -780,7 +780,7 @@ func loadTemporalAccessConfig(ctx context.Context, twd twdResource) (temporalAcc
 		SupportsCounts: true,
 	}
 
-	if conn.Spec.APIKeySecretRef != nil {
+	if conn.Spec.APIKeySecretRef != nil && strings.TrimSpace(conn.Spec.APIKeySecretRef.Name) != "" && strings.TrimSpace(conn.Spec.APIKeySecretRef.Key) != "" {
 		secretData, err := loadSecretData(kctx, twd.Metadata.Namespace, conn.Spec.APIKeySecretRef.Name)
 		if err != nil {
 			return temporalAccessConfig{}, err
@@ -799,7 +799,7 @@ func loadTemporalAccessConfig(ctx context.Context, twd twdResource) (temporalAcc
 		return cfg, nil
 	}
 
-	if conn.Spec.MutualTLSSecretRef != nil {
+	if conn.Spec.MutualTLSSecretRef != nil && strings.TrimSpace(conn.Spec.MutualTLSSecretRef.Name) != "" {
 		secretData, err := loadSecretData(kctx, twd.Metadata.Namespace, conn.Spec.MutualTLSSecretRef.Name)
 		if err != nil {
 			return temporalAccessConfig{}, err
@@ -827,7 +827,7 @@ func loadTemporalAccessConfig(ctx context.Context, twd twdResource) (temporalAcc
 		return cfg, nil
 	}
 
-	return temporalAccessConfig{}, fmt.Errorf("TemporalConnection %s/%s has no API key or mTLS secret configured", twd.Metadata.Namespace, connectionName)
+	return temporalAccessConfig{}, fmt.Errorf("TemporalConnection %s/%s has no valid API key or mTLS secret configured", twd.Metadata.Namespace, connectionName)
 }
 
 func loadSecretData(ctx context.Context, namespace, name string) (map[string]string, error) {
