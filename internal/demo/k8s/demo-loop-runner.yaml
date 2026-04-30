@@ -109,6 +109,10 @@ spec:
               value: "1"
             - name: CONTINUE_ON_TRAFFIC_FAILURE
               value: "1"
+            - name: TEMPORAL_API_KEY_SECRET_NAME
+              value: "__TEMPORAL_API_KEY_SECRET_NAME__"
+            - name: TEMPORAL_API_KEY_SECRET_KEY
+              value: "__TEMPORAL_API_KEY_SECRET_KEY__"
             - name: TEMPORAL_API_KEY
               valueFrom:
                 secretKeyRef:
