@@ -1,9 +1,9 @@
 package main
 
 import (
-	"encoding/base64"
 	"context"
 	"embed"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -38,21 +38,21 @@ type twdResource struct {
 		} `json:"workerOptions"`
 	} `json:"spec"`
 	Status struct {
-		TargetVersion     versionRef      `json:"targetVersion"`
-		CurrentVersion    *versionRef     `json:"currentVersion,omitempty"`
-		DeprecatedVersion []versionRef    `json:"deprecatedVersions,omitempty"`
-		Conditions        []condition     `json:"conditions,omitempty"`
-		VersionCount      int             `json:"versionCount,omitempty"`
+		TargetVersion     versionRef   `json:"targetVersion"`
+		CurrentVersion    *versionRef  `json:"currentVersion,omitempty"`
+		DeprecatedVersion []versionRef `json:"deprecatedVersions,omitempty"`
+		Conditions        []condition  `json:"conditions,omitempty"`
+		VersionCount      int          `json:"versionCount,omitempty"`
 	} `json:"status"`
 }
 
 type versionRef struct {
-	BuildID        string         `json:"buildID"`
-	Status         string         `json:"status"`
-	RampPercentage *float64       `json:"rampPercentage,omitempty"`
-	Deployment     *objectRef     `json:"deployment,omitempty"`
-	RampingSince   *time.Time     `json:"rampingSince,omitempty"`
-	DrainedSince   *time.Time     `json:"drainedSince,omitempty"`
+	BuildID        string     `json:"buildID"`
+	Status         string     `json:"status"`
+	RampPercentage *float64   `json:"rampPercentage,omitempty"`
+	Deployment     *objectRef `json:"deployment,omitempty"`
+	RampingSince   *time.Time `json:"rampingSince,omitempty"`
+	DrainedSince   *time.Time `json:"drainedSince,omitempty"`
 }
 
 type objectRef struct {
@@ -87,8 +87,8 @@ type deploymentListResource struct {
 
 type temporalConnectionResource struct {
 	Spec struct {
-		HostPort           string `json:"hostPort"`
-		APIKeySecretRef    *struct {
+		HostPort        string `json:"hostPort"`
+		APIKeySecretRef *struct {
 			Name string `json:"name"`
 			Key  string `json:"key"`
 		} `json:"apiKeySecretRef,omitempty"`
@@ -114,40 +114,65 @@ type temporalAccessConfig struct {
 }
 
 type versionCard struct {
-	BuildID         string   `json:"buildId"`
-	Role            string   `json:"role"`
-	Status          string   `json:"status"`
-	RampPct         *float64 `json:"-"`
+	BuildID string   `json:"buildId"`
+	Role    string   `json:"role"`
+	Status  string   `json:"status"`
+	RampPct *float64 `json:"-"`
 	// TrafficPct is the share of *new* workflow starts routed here (0-100).
 	// nil means "not applicable" (draining versions don't receive new starts).
-	TrafficPct      *float64 `json:"trafficPct,omitempty"`
+	TrafficPct *float64 `json:"trafficPct,omitempty"`
 	// Draining is true for deprecated versions that are still serving pinned workflows.
-	Draining        bool     `json:"draining"`
-	ActiveWorkflowCount int  `json:"activeWorkflowCount,omitempty"`
+	Draining            bool     `json:"draining"`
+	ActiveWorkflowCount int      `json:"activeWorkflowCount,omitempty"`
 	ActiveWorkflowPct   *float64 `json:"activeWorkflowPct,omitempty"`
-	Deployment      string   `json:"deployment,omitempty"`
-	Replicas        int      `json:"replicas"`
-	ReadyReplicas   int      `json:"readyReplicas"`
+	Deployment          string   `json:"deployment,omitempty"`
+	Replicas            int      `json:"replicas"`
+	ReadyReplicas       int      `json:"readyReplicas"`
 }
 
 type apiState struct {
-	Name                 string        `json:"name"`
-	Namespace            string        `json:"namespace"`
-	FetchedAt            time.Time     `json:"fetchedAt"`
-	VersionCount         int           `json:"versionCount"`
-	ActiveVersions       int           `json:"activeVersions"`
-	ActiveWorkflowTotal  int           `json:"activeWorkflowTotal,omitempty"`
-	PinnedLikely         bool          `json:"pinnedLikely"`
-	SlotsUsed            *float64      `json:"slotsUsed,omitempty"`
-	SlotsCapacity        *float64      `json:"slotsCapacity,omitempty"`
-	SlotUtilizationPct   *float64      `json:"slotUtilizationPct,omitempty"`
-	MetricsNote          string        `json:"metricsNote,omitempty"`
-	ActiveWorkflowNote   string        `json:"activeWorkflowNote,omitempty"`
-	Progressing          *condition    `json:"progressing,omitempty"`
-	Ready                *condition    `json:"ready,omitempty"`
-	TemporalConnection   *condition    `json:"temporalConnection,omitempty"`
-	Versions             []versionCard `json:"versions"`
-	Error                string        `json:"error,omitempty"`
+	Name                string        `json:"name"`
+	Namespace           string        `json:"namespace"`
+	FetchedAt           time.Time     `json:"fetchedAt"`
+	VersionCount        int           `json:"versionCount"`
+	ActiveVersions      int           `json:"activeVersions"`
+	ActiveWorkflowTotal int           `json:"activeWorkflowTotal,omitempty"`
+	PinnedLikely        bool          `json:"pinnedLikely"`
+	SlotsUsed           *float64      `json:"slotsUsed,omitempty"`
+	SlotsCapacity       *float64      `json:"slotsCapacity,omitempty"`
+	SlotUtilizationPct  *float64      `json:"slotUtilizationPct,omitempty"`
+	MetricsNote         string        `json:"metricsNote,omitempty"`
+	ActiveWorkflowNote  string        `json:"activeWorkflowNote,omitempty"`
+	Progressing         *condition    `json:"progressing,omitempty"`
+	Ready               *condition    `json:"ready,omitempty"`
+	TemporalConnection  *condition    `json:"temporalConnection,omitempty"`
+	Versions            []versionCard `json:"versions"`
+	Error               string        `json:"error,omitempty"`
+}
+
+type executionEntry struct {
+	ID      string `json:"id"`
+	Version string `json:"version"`
+}
+
+type versionStatus string
+
+const (
+	versionStatusActive   versionStatus = "active"
+	versionStatusRamping  versionStatus = "ramping"
+	versionStatusDraining versionStatus = "draining"
+	versionStatusInactive versionStatus = "inactive"
+)
+
+type versionInfo struct {
+	Status  versionStatus `json:"status"`
+	Running int           `json:"running"`
+	Ramping int           `json:"ramping"`
+}
+
+type executionsAPIResponse struct {
+	Executions []executionEntry       `json:"executions"`
+	Versions   map[string]versionInfo `json:"versions"`
 }
 
 type promQueryResponse struct {
@@ -190,9 +215,9 @@ var configCache temporalAccessConfigCache
 // stateCache caches the full /api/state response so that rapid browser polls
 // (every 3s) don't each spawn a new batch of kubectl+temporal subprocesses.
 type stateCacheEntry struct {
-	mu      sync.Mutex
-	state   *apiState
-	updated time.Time
+	mu       sync.Mutex
+	state    *apiState
+	updated  time.Time
 	inflight bool
 }
 
@@ -270,6 +295,21 @@ func main() {
 		stateCache.mu.Unlock()
 
 		_ = json.NewEncoder(w).Encode(state)
+	})
+
+	mux.HandleFunc("/api/executions", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		ctx, cancel := context.WithTimeout(r.Context(), 75*time.Second)
+		defer cancel()
+
+		resp, err := collectExecutions(ctx, *namespace, *name)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(resp)
 	})
 
 	addr := fmt.Sprintf(":%d", *port)
@@ -473,6 +513,163 @@ func collectState(ctx context.Context, namespace, name string) (apiState, error)
 	return state, nil
 }
 
+func collectExecutions(ctx context.Context, namespace, name string) (executionsAPIResponse, error) {
+	var twd twdResource
+	if err := kubectlJSON(ctx, &twd, "-n", namespace, "get", "temporalworkerdeployment", name, "-o", "json"); err != nil {
+		return executionsAPIResponse{}, err
+	}
+
+	cfg, err := loadTemporalAccessConfig(ctx, twd)
+	if err != nil {
+		return executionsAPIResponse{}, fmt.Errorf("failed to load temporal access config: %w", err)
+	}
+	defer cleanupTempFiles(cfg.TempFiles)
+
+	deploymentKey := fmt.Sprintf("%s/%s", namespace, name)
+	query := fmt.Sprintf(`ExecutionStatus="Running" AND TemporalWorkerDeployment=%q`, deploymentKey)
+
+	executions, err := temporalWorkflowList(ctx, cfg, query, deploymentKey)
+	if err != nil {
+		return executionsAPIResponse{}, fmt.Errorf("failed to list workflows: %w", err)
+	}
+
+	// Build version info from TWD status
+	versions := make(map[string]versionInfo)
+
+	// Count running workflows per version
+	runningByVersion := make(map[string]int)
+	for _, e := range executions {
+		if e.Version != "" {
+			runningByVersion[e.Version]++
+		}
+	}
+
+	if twd.Status.CurrentVersion != nil && twd.Status.CurrentVersion.BuildID != "" {
+		bid := twd.Status.CurrentVersion.BuildID
+		ramp := 100
+		if twd.Status.TargetVersion.BuildID != "" && twd.Status.TargetVersion.RampPercentage != nil {
+			ramp = 100 - int(*twd.Status.TargetVersion.RampPercentage)
+		}
+		versions[bid] = versionInfo{
+			Status:  versionStatusActive,
+			Running: runningByVersion[bid],
+			Ramping: ramp,
+		}
+	}
+
+	if twd.Status.TargetVersion.BuildID != "" {
+		bid := twd.Status.TargetVersion.BuildID
+		ramp := 0
+		status := versionStatusInactive
+		switch strings.ToLower(twd.Status.TargetVersion.Status) {
+		case "ramping":
+			status = versionStatusRamping
+			if twd.Status.TargetVersion.RampPercentage != nil {
+				ramp = int(*twd.Status.TargetVersion.RampPercentage)
+			}
+		case "current":
+			status = versionStatusActive
+			ramp = 100
+		}
+		// Don't overwrite if already added as current
+		if _, exists := versions[bid]; !exists {
+			versions[bid] = versionInfo{
+				Status:  status,
+				Running: runningByVersion[bid],
+				Ramping: ramp,
+			}
+		}
+	}
+
+	for _, v := range twd.Status.DeprecatedVersion {
+		if v.BuildID == "" {
+			continue
+		}
+		versions[v.BuildID] = versionInfo{
+			Status:  versionStatusDraining,
+			Running: runningByVersion[v.BuildID],
+			Ramping: 0,
+		}
+	}
+
+	return executionsAPIResponse{
+		Executions: executions,
+		Versions:   versions,
+	}, nil
+}
+
+type workflowListEntry struct {
+	WorkflowID string `json:"workflowId"`
+	// SearchAttributes may contain TemporalWorkerDeploymentVersion
+	SearchAttributes struct {
+		TemporalWorkerDeploymentVersion []string `json:"TemporalWorkerDeploymentVersion"`
+	} `json:"searchAttributes"`
+}
+
+func temporalWorkflowList(ctx context.Context, cfg temporalAccessConfig, query, deploymentKey string) ([]executionEntry, error) {
+	tempCtx, tempCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer tempCancel()
+
+	args := []string{
+		"workflow", "list",
+		"--query", query,
+		"--address", cfg.Address,
+		"--namespace", cfg.Namespace,
+		"--output", "json",
+		"--limit", "1000",
+	}
+	if cfg.UseTLS {
+		args = append(args, "--tls")
+	}
+	if cfg.APIKey != "" {
+		args = append(args, "--api-key", cfg.APIKey)
+	}
+	if cfg.TLSCertPath != "" {
+		args = append(args, "--tls-cert-path", cfg.TLSCertPath)
+	}
+	if cfg.TLSKeyPath != "" {
+		args = append(args, "--tls-key-path", cfg.TLSKeyPath)
+	}
+
+	cmd := exec.CommandContext(tempCtx, "temporal", args...)
+	b, err := cmd.Output()
+	if err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			stderr := strings.TrimSpace(string(ee.Stderr))
+			if stderr != "" {
+				return nil, fmt.Errorf("temporal workflow list: %s", stderr)
+			}
+		}
+		return nil, fmt.Errorf("temporal workflow list: %w", err)
+	}
+
+	var entries []workflowListEntry
+	if err := json.Unmarshal(b, &entries); err != nil {
+		return nil, fmt.Errorf("failed to parse workflow list output: %w", err)
+	}
+
+	executions := make([]executionEntry, 0, len(entries))
+	for _, e := range entries {
+		version := ""
+		if len(e.SearchAttributes.TemporalWorkerDeploymentVersion) > 0 {
+			// Format is "namespace/name:buildID" — extract the buildID part
+			raw := e.SearchAttributes.TemporalWorkerDeploymentVersion[0]
+			if strings.HasPrefix(raw, deploymentKey+":") {
+				version = strings.TrimPrefix(raw, deploymentKey+":")
+			} else {
+				version = raw
+			}
+		}
+		executions = append(executions, executionEntry{
+			ID:      e.WorkflowID,
+			Version: version,
+		})
+	}
+
+	return executions, nil
+}
+
 func enrichActiveWorkflowData(ctx context.Context, twd twdResource, cards []versionCard) (int, map[string]int, string) {
 	cfg, err := loadTemporalAccessConfig(ctx, twd)
 	if err != nil {
@@ -671,10 +868,10 @@ func buildCard(ctx context.Context, role string, v versionRef) versionCard {
 // computeTraffic assigns a new-workflow routing percentage to each version.
 //
 // Temporal's rainbow deployment model:
-//  - One "target" version receives rampPercentage% of new workflow starts.
-//  - One "current" version receives (100 - rampPercentage)% of new starts.
-//  - "deprecated" versions receive 0% of new starts but are still alive serving
-//    their pinned, in-flight workflows (Draining state).
+//   - One "target" version receives rampPercentage% of new workflow starts.
+//   - One "current" version receives (100 - rampPercentage)% of new starts.
+//   - "deprecated" versions receive 0% of new starts but are still alive serving
+//     their pinned, in-flight workflows (Draining state).
 //
 // TrafficPct is set only for current/target (new-workflow routing).
 // Deprecated/draining versions get Draining=true so the UI shows them correctly.
