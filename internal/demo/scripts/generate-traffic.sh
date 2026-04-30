@@ -1,5 +1,5 @@
-#!/bin/bash
-set -euo pipefail
+#!/bin/sh
+set -eu
 
 # Configuration
 NAMESPACE="${NAMESPACE:-default}"
@@ -113,10 +113,10 @@ for i in $(seq 1 "$launch_target"); do
     $VERSIONING_ARGS \
     2>&1; then
     echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ✓ Started workflow: $WORKFLOW_ID"
-    ((SUCCESS_COUNT+=1))
+    SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
   else
     echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ✗ Failed to start workflow: $WORKFLOW_ID (may be retried on next run)"
-    ((FAIL_COUNT+=1))
+    FAIL_COUNT=$((FAIL_COUNT + 1))
   fi
   
   # Small delay between starts
