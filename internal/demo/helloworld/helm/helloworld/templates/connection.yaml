@@ -10,14 +10,15 @@ spec:
   hostPort: "{{ .Values.temporal.address }}"
   {{- $apiSecretName := .Values.temporal.apiKey.name | trim }}
   {{- $apiSecretKey := .Values.temporal.apiKey.key | trim }}
+  {{- $mtlsName := .Values.temporal.mtlsSecretName | default "" | trim | trimAll "\"" }}
   {{- if $apiSecretName }}
   apiKeySecretRef:
     name: {{ $apiSecretName | quote }}
     key: {{ $apiSecretKey | quote }}
-  {{- end }}
-  {{- $mtlsName := .Values.temporal.mtlsSecretName | default "" | trim | trimAll "\"" }}
-  {{- if $mtlsName }}
+  mutualTLSSecretRef: null
+  {{- else if $mtlsName }}
   mutualTLSSecretRef:
     name: {{ $mtlsName | quote }}
+  apiKeySecretRef: null
   {{- end }}
 {{- end }}
