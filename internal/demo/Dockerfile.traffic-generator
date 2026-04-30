@@ -1,12 +1,17 @@
 FROM alpine:latest
 
+ARG TARGETARCH
+ARG TEMPORAL_CLI_VERSION=1.6.2
+
 # Install necessary tools
-RUN apk add --no-cache ca-certificates bash curl
+RUN apk add --no-cache ca-certificates bash curl jq
 
 # Download and install Temporal CLI
 RUN mkdir -p /usr/local/bin && \
-    curl -sSL https://github.com/temporalio/cli/releases/latest/download/temporal-linux-amd64 -o /usr/local/bin/temporal && \
-    chmod +x /usr/local/bin/temporal
+    curl -fsSL "https://github.com/temporalio/cli/releases/download/v${TEMPORAL_CLI_VERSION}/temporal_cli_${TEMPORAL_CLI_VERSION}_linux_${TARGETARCH}.tar.gz" -o /tmp/temporal.tar.gz && \
+    tar -xzf /tmp/temporal.tar.gz -C /usr/local/bin temporal && \
+    chmod +x /usr/local/bin/temporal && \
+    rm /tmp/temporal.tar.gz
 
 # Copy traffic generation script
 COPY internal/demo/scripts/generate-traffic.sh /scripts/generate-traffic.sh

@@ -51,6 +51,7 @@ spec:
   #   "*/2 * * * *"    = every 2 minutes
   #   "*/5 * * * *"    = every 5 minutes
   schedule: "*/2 * * * *"
+  suspend: true
   
   concurrencyPolicy: Forbid
   
@@ -81,7 +82,7 @@ spec:
           containers:
           - name: traffic-generator
             # Custom traffic generator image with Temporal CLI
-            image: 025066239481.dkr.ecr.us-east-2.amazonaws.com/traffic-generator:910e14b-20260428100845
+            image: 025066239481.dkr.ecr.us-east-2.amazonaws.com/traffic-generator:22f1066-20260428231207-amd64-v2
             imagePullPolicy: IfNotPresent
             
             env:

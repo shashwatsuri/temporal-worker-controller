@@ -381,26 +381,32 @@ func collectState(ctx context.Context, namespace, name string) (apiState, error)
 		Versions:       cards,
 	}
 
-	if workflowTotal, workflowNote := enrichActiveWorkflowData(ctx, twd, cards); workflowTotal > 0 || workflowNote != "" {
+	workflowTotal, perVersionCounts, workflowNote := enrichActiveWorkflowData(ctx, twd, cards)
+	if workflowTotal > 0 || workflowNote != "" {
 		state.ActiveWorkflowTotal = workflowTotal
 		if workflowNote != "" {
 			state.ActiveWorkflowNote = workflowNote
 		}
 	}
 
-	// Hide fully drained/deprecated versions from the API payload once active
-	// workflow data is available and indicates zero remaining workload.
-	if state.ActiveWorkflowTotal > 0 {
+	// Apply per-version counts to cards.
+	for i := range cards {
+		if n, ok := perVersionCounts[cards[i].BuildID]; ok {
+			cards[i].ActiveWorkflowCount = n
+			if workflowTotal > 0 {
+				pct := float64(n) / float64(workflowTotal) * 100
+				cards[i].ActiveWorkflowPct = &pct
+			}
+		}
+	}
+	state.Versions = cards
+
+	// Hide any version with 0 active workflows — cards appear when a workflow
+	// starts on them and disappear when all finish, including current.
+	if workflowTotal > 0 {
 		filtered := make([]versionCard, 0, len(cards))
 		for _, c := range cards {
-			status := strings.ToLower(c.Status)
-			role := strings.ToLower(c.Role)
-			isDeprecatedLike := strings.Contains(role, "deprecated") || status == "inactive" || status == "drained" || status == "draining"
-			pct := 0.0
-			if c.ActiveWorkflowPct != nil {
-				pct = *c.ActiveWorkflowPct
-			}
-			if isDeprecatedLike && c.ActiveWorkflowCount <= 0 && pct <= 0 {
+			if c.ActiveWorkflowCount <= 0 {
 				continue
 			}
 			filtered = append(filtered, c)
@@ -467,14 +473,14 @@ func collectState(ctx context.Context, namespace, name string) (apiState, error)
 	return state, nil
 }
 
-func enrichActiveWorkflowData(ctx context.Context, twd twdResource, cards []versionCard) (int, string) {
+func enrichActiveWorkflowData(ctx context.Context, twd twdResource, cards []versionCard) (int, map[string]int, string) {
 	cfg, err := loadTemporalAccessConfig(ctx, twd)
 	if err != nil {
 		log.Printf("dashboard: failed to load temporal access config: %v", err)
-		if total, ok := applyCachedWorkflowData(cards); ok {
-			return total, "Using recent cached active workflow percentages while live query retries."
+		if total, counts, ok := applyCachedWorkflowData(); ok {
+			return total, counts, "Using recent cached active workflow percentages while live query retries."
 		}
-		return 0, ""
+		return 0, nil, ""
 	}
 	defer cleanupTempFiles(cfg.TempFiles)
 
@@ -483,135 +489,65 @@ func enrichActiveWorkflowData(ctx context.Context, twd twdResource, cards []vers
 	total, err := temporalWorkflowCount(ctx, cfg, totalQuery)
 	if err != nil {
 		log.Printf("dashboard: failed to query total active workflows for %s: %v", deploymentKey, err)
-		if cachedTotal, ok := applyCachedWorkflowData(cards); ok {
-			return cachedTotal, "Using recent cached active workflow percentages while live query retries."
+		if cachedTotal, counts, ok := applyCachedWorkflowData(); ok {
+			return cachedTotal, counts, "Using recent cached active workflow percentages while live query retries."
 		}
-		return 0, ""
+		return 0, nil, ""
 	}
 	if total == 0 {
 		// Avoid immediately dropping cache on transient zero-count reads.
-		if cachedTotal, ok := applyCachedWorkflowData(cards); ok {
-			return cachedTotal, "Using recent cached active workflow percentages while live query retries."
+		if cachedTotal, counts, ok := applyCachedWorkflowData(); ok {
+			return cachedTotal, counts, "Using recent cached active workflow percentages while live query retries."
 		}
-		return 0, ""
+		return 0, nil, ""
 	}
 
-	notes := make([]string, 0, 1)
-	queriedCounts := make(map[string]int, len(cards))
-	attemptedCounts := 0
-
-	for i := range cards {
-		if cards[i].BuildID == "" {
+	// Per-version counts: workflows are now pinned to a specific version via
+	// --versioning-override, so each workflow only accumulates one entry in
+	// TemporalWorkerDeploymentVersion. The KeywordList "=" contains-check is
+	// therefore accurate for pinned workflows.
+	perVersion := make(map[string]int)
+	for _, c := range cards {
+		if c.BuildID == "" {
 			continue
 		}
-		if !shouldQueryActiveWorkflowCount(cards[i]) {
+		s := strings.ToLower(c.Status)
+		// Only query versions that could have active workflows.
+		if s == "drained" || s == "notregistered" {
 			continue
 		}
-		attemptedCounts++
-		versionKey := fmt.Sprintf("%s:%s", deploymentKey, cards[i].BuildID)
-		query := fmt.Sprintf(`ExecutionStatus="Running" AND TemporalWorkerDeploymentVersion=%q`, versionKey)
-		count, err := temporalWorkflowCount(ctx, cfg, query)
-		if err != nil {
-			log.Printf("dashboard: failed to query active workflows for version %s: %v", cards[i].BuildID[:min(12, len(cards[i].BuildID))], err)
-			notes = append(notes, "some active workflow percentages unavailable")
+		versionKey := fmt.Sprintf("%s:%s", deploymentKey, c.BuildID)
+		vQuery := fmt.Sprintf(`ExecutionStatus="Running" AND TemporalWorkerDeploymentVersion=%q`, versionKey)
+		count, qErr := temporalWorkflowCount(ctx, cfg, vQuery)
+		if qErr != nil {
+			log.Printf("dashboard: per-version count failed for %s: %v", c.BuildID, qErr)
 			continue
 		}
-		queriedCounts[cards[i].BuildID] = count
-		cards[i].ActiveWorkflowCount = count
-		pct := (float64(count) / float64(total)) * 100
-		cards[i].ActiveWorkflowPct = &pct
+		if count > 0 {
+			perVersion[c.BuildID] = count
+		}
 	}
 
-	// Cache the latest known total even if per-version counts are partial.
-	writeCachedWorkflowData(total, queriedCounts)
-
-	if attemptedCounts > 0 && len(queriedCounts) != attemptedCounts {
-		log.Printf("dashboard: partial workflow count results: %d/%d versions succeeded", len(queriedCounts), attemptedCounts)
-		applyPartialCachedWorkflowData(cards, total)
-	}
-
-	if len(notes) > 0 {
-		return total, notes[0]
-	}
-	return total, ""
+	writeCachedWorkflowData(total, perVersion)
+	return total, perVersion, ""
 }
 
-// min returns the minimum of two integers
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func shouldQueryActiveWorkflowCount(card versionCard) bool {
-	status := strings.ToLower(card.Status)
-	role := strings.ToLower(card.Role)
-
-	if strings.Contains(role, "current") || strings.Contains(role, "target") {
-		return true
-	}
-	if status == "ramping" || status == "draining" || status == "current" {
-		return true
-	}
-	// Deliberately omit a ReadyReplicas > 0 fallback: stale K8s deployments for
-	// deprecated/inactive versions still have running pods but their workflows are
-	// attributed to whichever version IDs actually executed them.
-	// TemporalWorkerDeploymentVersion is a keyword-list attribute, so "=" means
-	// "contains", and the same workflow would be counted for every version that
-	// ever ran it — producing inflated double-counts across all stale replicas.
-	return false
-}
-
-func applyCachedWorkflowData(cards []versionCard) (int, bool) {
+func applyCachedWorkflowData() (int, map[string]int, bool) {
 	workflowCache.mu.RLock()
 	defer workflowCache.mu.RUnlock()
 	if workflowCache.total <= 0 {
-		return 0, false
+		return 0, nil, false
 	}
 	if time.Since(workflowCache.updated) > 2*time.Minute {
-		return 0, false
+		return 0, nil, false
 	}
-	for i := range cards {
-		count, ok := workflowCache.counts[cards[i].BuildID]
-		if !ok {
-			continue
-		}
-		cards[i].ActiveWorkflowCount = count
-		pct := (float64(count) / float64(workflowCache.total)) * 100
-		cards[i].ActiveWorkflowPct = &pct
-	}
-	return workflowCache.total, true
-}
-
-func applyPartialCachedWorkflowData(cards []versionCard, total int) {
-	workflowCache.mu.RLock()
-	defer workflowCache.mu.RUnlock()
-	if workflowCache.total != total || len(workflowCache.counts) == 0 {
-		return
-	}
-	for i := range cards {
-		if cards[i].ActiveWorkflowPct != nil {
-			continue
-		}
-		count, ok := workflowCache.counts[cards[i].BuildID]
-		if !ok {
-			continue
-		}
-		cards[i].ActiveWorkflowCount = count
-		pct := (float64(count) / float64(total)) * 100
-		cards[i].ActiveWorkflowPct = &pct
-	}
+	return workflowCache.total, workflowCache.counts, true
 }
 
 func writeCachedWorkflowData(total int, counts map[string]int) {
-	copyCounts := make(map[string]int, len(counts))
-	for k, v := range counts {
-		copyCounts[k] = v
-	}
 	workflowCache.mu.Lock()
 	workflowCache.total = total
-	workflowCache.counts = copyCounts
+	workflowCache.counts = counts
 	workflowCache.updated = time.Now()
 	workflowCache.mu.Unlock()
 }

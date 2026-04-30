@@ -21,7 +21,7 @@ temporal:
 schedule:
   id: rainbow-release-schedule
   cron: "*/2 * * * *"
-  paused: false
+  paused: true
   taskQueue: default/rainbow-release
   workflowId: rainbow-release-run
   catchupWindow: 1m

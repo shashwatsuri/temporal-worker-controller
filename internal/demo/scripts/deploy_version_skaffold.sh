@@ -32,6 +32,7 @@ SKAFFOLD_PROFILE="${SKAFFOLD_PROFILE:-helloworld-worker}"
 DRY_RUN="${DRY_RUN:-0}"
 WAIT_FOR_TWD_ROLLOUT="${WAIT_FOR_TWD_ROLLOUT:-0}"
 ROLLOUT_TIMEOUT_SECONDS="${ROLLOUT_TIMEOUT_SECONDS:-300}"
+ENSURE_NAMESPACE="${ENSURE_NAMESPACE:-0}"
 
 if [ -z "$IMAGE_TAG" ]; then
   echo "[$TIMESTAMP] ERROR: IMAGE_TAG required"
@@ -57,14 +58,20 @@ IMAGE_TAG_WITHOUT_SUFFIX=$(echo "$IMAGE_TAG" | cut -d: -f1)
 ECR_REPO="${IMAGE_TAG_WITHOUT_SUFFIX%/*}"
 TAG=$(echo "$IMAGE_TAG" | cut -d: -f2)
 
-if [ -z "$SKAFFOLD_DEFAULT_REPO" ]; then
+if [ -z "${SKAFFOLD_DEFAULT_REPO:-}" ]; then
   SKAFFOLD_DEFAULT_REPO="$ECR_REPO"
   echo "[$TIMESTAMP] Using ECR repo from IMAGE_TAG: $SKAFFOLD_DEFAULT_REPO"
 fi
 
-# 1. Ensure namespace exists
-echo "[$TIMESTAMP] Ensuring namespace $NAMESPACE exists..."
-kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f - || true
+# 1. Ensure namespace exists when explicitly requested.
+if kubectl get namespace "$NAMESPACE" >/dev/null 2>&1; then
+  echo "[$TIMESTAMP] Namespace $NAMESPACE already exists"
+elif [ "$ENSURE_NAMESPACE" = "1" ]; then
+  echo "[$TIMESTAMP] Creating namespace $NAMESPACE"
+  kubectl create namespace "$NAMESPACE"
+else
+  echo "[$TIMESTAMP] Namespace $NAMESPACE not verified; continuing with ENSURE_NAMESPACE=0"
+fi
 
 # 2. Create skaffold artifacts JSON (tells skaffold to use pre-built image, no build)
 ARTIFACTS_FILE="/tmp/skaffold-artifacts-${TIMESTAMP%:*}.json"
@@ -95,7 +102,7 @@ if [ "$DRY_RUN" = "1" ]; then
     --build-artifacts "$ARTIFACTS_FILE" \
     --namespace "$NAMESPACE" \
     --dry-run=client \
-    --no-prune 2>&1 || {
+    2>&1 || {
       echo "[$TIMESTAMP] ERROR: Skaffold dry-run failed"
       rm -f "$ARTIFACTS_FILE"
       exit 1
@@ -113,7 +120,6 @@ skaffold deploy \
   --profile "$SKAFFOLD_PROFILE" \
   --build-artifacts "$ARTIFACTS_FILE" \
   --namespace "$NAMESPACE" \
-  --no-prune \
   2>&1 || {
     echo "[$TIMESTAMP] ERROR: Skaffold deploy failed"
     rm -f "$ARTIFACTS_FILE"

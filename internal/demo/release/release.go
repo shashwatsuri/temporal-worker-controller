@@ -264,30 +264,7 @@ func buildJob(jobName string, req Request) *batchv1.Job {
 }
 
 func jobCommand() string {
-	return strings.TrimSpace(`
-set -eu
-
-TIMESTAMP=$(date '+%H:%M:%S')
-echo "[$TIMESTAMP] Starting Temporal-triggered rainbow release"
-
-WORK_DIR=$(mktemp -d)
-trap 'rm -rf "$WORK_DIR"' EXIT
-
-git clone --depth 1 --branch "$REPO_REF" "$REPO_URL" "$WORK_DIR/repo"
-cd "$WORK_DIR/repo"
-
-	IMAGE_TAG=$(ROOT_DIR="$WORK_DIR/repo" /opt/release-scripts/generate_version_cron.sh | tail -n 1)
-if [ -z "$IMAGE_TAG" ]; then
-  echo "[$TIMESTAMP] ERROR: generate_version_cron.sh did not produce an image tag"
-  exit 1
-fi
-
-export DD_GIT_COMMIT_SHA=$(git rev-parse HEAD)
-export DD_GIT_REPOSITORY_URL="$REPO_URL"
-
-	/opt/release-scripts/build_version_kaniko.sh "$IMAGE_TAG"
-	/opt/release-scripts/deploy_version_skaffold.sh "$IMAGE_TAG" "$NAMESPACE" "$RELEASE_NAME"
-`)
+	return strings.TrimSpace(`/opt/release-scripts/run_release_once.sh`)
 }
 
 func jobNameForWorkflow(workflowID string) string {

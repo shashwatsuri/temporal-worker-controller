@@ -437,7 +437,33 @@ This gives you a completely fresh start and frees up disk space used by minikube
 
 ---
 
-## Temporal Schedule-Based Version Generation (Recommended)
+## Unified Demo Runner (Recommended for EKS)
+
+The demo now supports a single in-cluster runner that loops every 2 minutes on EKS. Each cycle:
+
+1. Builds and deploys a new HelloWorld worker version using the existing rainbow release scripts.
+2. Counts only running `HelloWorld` workflows for `default/helloworld`.
+3. Starts at most 5 new workflows and never lets the running `HelloWorld` total exceed 10.
+
+Deploy it with the EKS helper:
+
+```bash
+./internal/demo/scripts/deploy_eks_demo.sh
+```
+
+Validation:
+
+```bash
+kubectl -n default logs deployment/rainbow-demo-runner -f
+kubectl -n default get deployment rainbow-demo-runner
+kubectl -n default get cronjob traffic-generator rainbow-version-generator -o custom-columns='NAME:.metadata.name,SUSPEND:.spec.suspend'
+```
+
+The helper also suspends the legacy traffic CronJob, scales the old `rainbow-release-manager` deployment to zero, and pauses the legacy Temporal schedule when it can authenticate with the same Temporal API key secret used by the demo.
+
+---
+
+## Legacy Temporal Schedule-Based Version Generation
 
 The recommended release trigger is now a Temporal Schedule that starts a release workflow on a fixed interval. The workflow creates a one-shot Kubernetes Job that runs the existing generation/build/deploy scripts (`generate_version_cron.sh`, `build_version_kaniko.sh`, `deploy_version_skaffold.sh`).
 
@@ -478,7 +504,7 @@ kubectl -n default get temporalworkerdeployment helloworld -o json | jq '.status
 
 ---
 
-## Kubernetes CronJob-Based Version Generation (EKS)
+## Legacy Kubernetes CronJob-Based Version Generation (EKS)
 
 This path is now legacy/fallback. Prefer the Temporal Schedule-based trigger above.
 

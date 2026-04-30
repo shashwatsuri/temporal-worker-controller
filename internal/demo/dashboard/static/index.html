@@ -235,14 +235,8 @@
         <div class="hint">Concurrent worker versions serving traffic or draining</div>
       </div>
       <div class="card">
-        <div class="label">Slot Utilization</div>
-        <div class="value" id="slotUtilization">-</div>
-        <div class="hint" id="slotHint">Live from Prometheus</div>
-      </div>
-      <div class="card">
-        <div class="label">Slots Used</div>
-        <div class="value" id="slotsUsed">-</div>
-        <div class="hint" id="slotsCapacity">Capacity: -</div>
+        <div class="label">Active Workflows</div>
+        <div class="hint" id="slotHint">Loading...</div>
       </div>
       <div class="card">
         <div class="label">Ready Condition</div>
@@ -349,8 +343,6 @@
       const activeVersionsEl = document.getElementById("activeVersions");
       activeVersionsEl.textContent = String(data.activeVersions ?? 0);
 
-      const util = typeof data.slotUtilizationPct === "number" ? `${data.slotUtilizationPct.toFixed(1)}%` : "-";
-      document.getElementById("slotUtilization").textContent = util;
       const slotHintParts = [];
       if (typeof data.activeWorkflowTotal === "number" && data.activeWorkflowTotal > 0) {
         slotHintParts.push(`Running workflows: ${data.activeWorkflowTotal}`);
@@ -358,13 +350,11 @@
       if (data.activeWorkflowNote && !String(data.activeWorkflowNote).toLowerCase().includes("temporarily unavailable")) {
         slotHintParts.push(data.activeWorkflowNote);
       }
-      slotHintParts.push(data.metricsNote || `Pinned likely: ${data.pinnedLikely ? "yes" : "no"}`);
+      if (data.metricsNote) {
+        slotHintParts.push(data.metricsNote);
+      }
       const slotHintEl = document.getElementById("slotHint");
-
-      const used = typeof data.slotsUsed === "number" ? data.slotsUsed.toFixed(1) : "-";
-      const cap = typeof data.slotsCapacity === "number" ? data.slotsCapacity.toFixed(1) : "-";
-      document.getElementById("slotsUsed").textContent = used;
-      document.getElementById("slotsCapacity").textContent = `Capacity: ${cap}`;
+      slotHintEl.textContent = slotHintParts.join(" · ") || "No active workflows";
 
       document.getElementById("ready").textContent = data.ready?.status === "True" ? "Ready" : "Not Ready";
       document.getElementById("readyReason").textContent = data.ready?.reason || "-";
@@ -425,6 +415,16 @@
       const incomingIds = new Set(incomingVersions.map(v => v?.buildId).filter(Boolean));
       for (const [buildId, cached] of retainedVersions.entries()) {
         if (incomingIds.has(buildId)) continue;
+
+        // If the backend returned a fresh activeWorkflowTotal this cycle, it means the
+        // workflow-count query succeeded. Any retained version NOT present in the API
+        // response was not queried (because it is deprecated/inactive) and therefore
+        // cannot reliably claim to have active workflows — its cached count is stale.
+        // Clear the count so it is not shown as "draining" with phantom workflows.
+        if (activeTotal !== null) {
+          retainedVersions.delete(buildId);
+          continue;
+        }
 
         const count = typeof cached.activeWorkflowCount === "number" ? cached.activeWorkflowCount : 0;
         const pct = typeof cached.activeWorkflowPct === "number" ? cached.activeWorkflowPct : 0;
