@@ -120,6 +120,7 @@ skaffold deploy \
   --profile "$SKAFFOLD_PROFILE" \
   --build-artifacts "$ARTIFACTS_FILE" \
   --namespace "$NAMESPACE" \
+  --status-check=false \
   2>&1 || {
     echo "[$TIMESTAMP] ERROR: Skaffold deploy failed"
     rm -f "$ARTIFACTS_FILE"

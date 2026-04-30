@@ -1,0 +1,123 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rainbow-demo-runner
+  annotations:
+    eks.amazonaws.com/role-arn: {{ .Values.aws.roleArn | quote }}
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: rainbow-demo-runner
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps", "pods", "pods/log", "secrets", "services", "serviceaccounts", "nodes", "events"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "replicasets", "daemonsets"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  - apiGroups: ["temporal.io"]
+    resources: ["temporalconnections", "temporalworkerdeployments"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rainbow-demo-runner
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: rainbow-demo-runner
+subjects:
+  - kind: ServiceAccount
+    name: rainbow-demo-runner
+    namespace: {{ .Release.Namespace }}
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rainbow-demo-runner
+  labels:
+    app: rainbow-demo-runner
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rainbow-demo-runner
+  template:
+    metadata:
+      labels:
+        app: rainbow-demo-runner
+    spec:
+      serviceAccountName: rainbow-demo-runner
+      restartPolicy: Always
+      containers:
+        - name: demo-runner
+          image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args: ["/opt/release-scripts/demo_loop.sh"]
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: RELEASE_NAME
+              value: {{ .Values.release.name | quote }}
+            - name: REPO_URL
+              value: {{ .Values.release.repoUrl | quote }}
+            - name: REPO_REF
+              value: {{ .Values.release.repoRef | quote }}
+            - name: WORKER
+              value: {{ .Values.release.worker | quote }}
+            - name: CONFIG_MAP_NAME
+              value: "rainbow-version-state"
+            - name: AWS_REGION
+              value: {{ .Values.aws.region | quote }}
+            - name: WAIT_FOR_TWD_ROLLOUT
+              value: {{ .Values.loop.waitForTwdRollout | quote }}
+            - name: LOOP_INTERVAL_SECONDS
+              value: {{ .Values.loop.intervalSeconds | quote }}
+            - name: TEMPORAL_ADDRESS
+              value: {{ .Values.temporal.address | quote }}
+            - name: TEMPORAL_NAMESPACE
+              value: {{ .Values.temporal.namespace | quote }}
+            - name: TEMPORAL_TASK_QUEUE
+              value: {{ .Values.temporal.taskQueue | default (printf "%s/%s" .Release.Namespace .Values.release.name) | quote }}
+            - name: TEMPORAL_WORKER_DEPLOYMENT
+              value: {{ .Values.temporal.workerDeployment | default (printf "%s/%s" .Release.Namespace .Values.release.name) | quote }}
+            - name: WORKFLOWS_PER_RUN
+              value: {{ .Values.loop.workflowsPerRun | quote }}
+            - name: MAX_NEW_WORKFLOWS_PER_RUN
+              value: {{ .Values.loop.maxNewWorkflowsPerRun | quote }}
+            - name: MAX_RUNNING_WORKFLOWS
+              value: {{ .Values.loop.maxRunningWorkflows | quote }}
+            - name: WORKFLOW_TYPE
+              value: "HelloWorld"
+            - name: CONTINUE_ON_RELEASE_FAILURE
+              value: {{ .Values.loop.continueOnReleaseFailure | quote }}
+            - name: CONTINUE_ON_TRAFFIC_FAILURE
+              value: {{ .Values.loop.continueOnTrafficFailure | quote }}
+            - name: TEMPORAL_API_KEY_SECRET_NAME
+              value: {{ .Values.temporal.apiKey.secretName | quote }}
+            - name: TEMPORAL_API_KEY_SECRET_KEY
+              value: {{ .Values.temporal.apiKey.secretKey | quote }}
+            - name: TEMPORAL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.temporal.apiKey.secretName | quote }}
+                  key: {{ .Values.temporal.apiKey.secretKey | quote }}
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 2Gi

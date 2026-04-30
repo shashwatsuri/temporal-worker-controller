@@ -1,0 +1,32 @@
+image:
+  repository: rainbow-release-job
+  tag: latest
+  pullPolicy: Always
+
+aws:
+  roleArn: ""
+  region: us-east-2
+
+release:
+  name: helloworld
+  repoUrl: https://github.com/shashwatsuri/temporal-worker-controller
+  repoRef: main
+  worker: helloworld
+
+loop:
+  intervalSeconds: "180"
+  waitForTwdRollout: "false"
+  workflowsPerRun: "5"
+  maxNewWorkflowsPerRun: "5"
+  maxRunningWorkflows: "10"
+  continueOnReleaseFailure: "1"
+  continueOnTrafficFailure: "1"
+
+temporal:
+  address: ""
+  namespace: ""
+  taskQueue: ""
+  workerDeployment: ""
+  apiKey:
+    secretName: temporal-api-key
+    secretKey: api-key

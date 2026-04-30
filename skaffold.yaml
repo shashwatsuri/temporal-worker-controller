@@ -133,6 +133,36 @@ profiles:
       platforms:
         - linux/arm64
 
+  # Deploy the demo loop runner that continuously releases new helloworld versions
+  - name: demo-loop-runner
+    build:
+      artifacts:
+        - image: rainbow-release-job
+          context: .
+          docker:
+            dockerfile: internal/demo/Dockerfile.release-job
+    manifests:
+      helm:
+        releases:
+          - name: demo-loop-runner
+            chartPath: internal/demo/k8s/demo-loop-runner
+            setValueTemplates:
+              image.repository: "{{ .IMAGE_REPO_rainbow_release_job }}"
+              image.tag: "{{ .IMAGE_TAG_rainbow_release_job }}"
+              temporal.address: "{{ .TEMPORAL_ADDRESS }}"
+              temporal.namespace: "{{ .TEMPORAL_NAMESPACE }}"
+              temporal.apiKey.secretName: "{{ .TEMPORAL_API_KEY_SECRET_NAME }}"
+              temporal.apiKey.secretKey: "{{ .TEMPORAL_API_KEY_SECRET_KEY }}"
+            setValues:
+              aws.roleArn: ""
+              aws.region: us-east-2
+              release.name: helloworld
+              release.repoUrl: https://github.com/shashwatsuri/temporal-worker-controller
+              release.repoRef: main
+              release.worker: helloworld
+            valuesFiles:
+              - internal/demo/k8s/demo-loop-runner/values.yaml
+
 deploy:
   helm:
     hooks:
