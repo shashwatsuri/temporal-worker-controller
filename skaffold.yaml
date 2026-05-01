@@ -90,7 +90,7 @@ profiles:
           docker:
             dockerfile: Dockerfile
             buildArgs:
-              VITE_API_BASE_URL: "{{ .VITE_API_BASE_URL }}"
+              VITE_API_BASE_URL: ""
     manifests:
       rawYaml:
         - internal/demo/k8s/dashboard-deployment.yaml
