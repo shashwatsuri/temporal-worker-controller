@@ -799,7 +799,7 @@ func TestUpdateVersionConfig_EmitsEventOnFailure(t *testing.T) {
 			r, recorder := newTestReconcilerWithInterceptors([]client.Object{twd}, interceptor.Funcs{})
 
 			p := &plan{WorkerDeploymentName: twd.Name, UpdateVersionConfig: tc.config}
-			err := r.updateVersionConfig(context.Background(), logr.Discard(), twd, tc.handle, p)
+			err := r.updateVersionConfig(context.Background(), logr.Discard(), twd, tc.handle, p, nil)
 			require.Error(t, err)
 			assertEventEmitted(t, drainEvents(recorder), tc.expectedReason)
 		})

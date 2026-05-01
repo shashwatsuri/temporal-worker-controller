@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rainbow-cleanup
+  labels:
+    app: rainbow-cleanup
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rainbow-cleanup
+  template:
+    metadata:
+      labels:
+        app: rainbow-cleanup
+    spec:
+      serviceAccountName: rainbow-demo-runner
+      restartPolicy: Always
+      volumes:
+        - name: scripts
+          configMap:
+            name: rainbow-cleanup-scripts
+            defaultMode: 0755
+      containers:
+        - name: cleanup
+          image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args: ["while true; do /opt/scripts/cleanup-drained-versions.sh || true; sleep \"$CLEANUP_INTERVAL\"; done"]
+          volumeMounts:
+            - name: scripts
+              mountPath: /opt/scripts
+              readOnly: true
+          env:
+            - name: CLEANUP_INTERVAL
+              value: {{ .Values.cleanup.intervalSeconds | quote }}
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: RELEASE_NAME
+              value: {{ .Values.release.name | quote }}
+            - name: TEMPORAL_ADDRESS
+              value: {{ .Values.temporal.address | quote }}
+            - name: TEMPORAL_NAMESPACE
+              value: {{ .Values.temporal.namespace | quote }}
+            - name: TEMPORAL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.temporal.apiKey.secretName }}
+                  key: {{ .Values.temporal.apiKey.secretKey }}
+            - name: WORKER_DEPLOYMENT_NAME
+              value: {{ .Values.temporal.workerDeployment | quote }}
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi

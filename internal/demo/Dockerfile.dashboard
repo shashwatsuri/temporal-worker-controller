@@ -10,11 +10,11 @@ COPY go.sum go.sum
 RUN go mod download
 
 # Copy dashboard source (context is root)
-COPY internal/demo/dashboard ./internal/demo/dashboard
+COPY internal/demo/api ./internal/demo/api
 COPY internal/demo/util ./internal/demo/util
 
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
-    go build -o dashboard ./internal/demo/dashboard
+    go build -o dashboard ./internal/demo/api
 
 RUN set -eux; \
     arch="${TARGETARCH:-}"; \
@@ -30,7 +30,11 @@ RUN set -eux; \
     rm -f /tmp/temporal.tar.gz
 
 # Runtime image with kubectl available for API calls
-FROM bitnami/kubectl:latest
+FROM alpine:3.21
+RUN apk add --no-cache curl ca-certificates && \
+    curl -fsSL "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" -o /usr/local/bin/kubectl && \
+    chmod +x /usr/local/bin/kubectl && \
+    apk del curl
 WORKDIR /
 COPY --from=builder /workspace/dashboard .
 COPY --from=builder /tmp/temporal /usr/local/bin/temporal

@@ -17,6 +17,7 @@ import (
 	temporaliov1alpha1 "github.com/temporalio/temporal-worker-controller/api/v1alpha1"
 	"github.com/temporalio/temporal-worker-controller/internal/k8s"
 	"github.com/temporalio/temporal-worker-controller/internal/planner"
+	"github.com/temporalio/temporal-worker-controller/internal/temporal"
 	enumspb "go.temporal.io/api/enums/v1"
 	sdkclient "go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
@@ -211,7 +212,7 @@ func (r *TemporalWorkerDeploymentReconciler) claimManagerIdentity(
 	return nil
 }
 
-func (r *TemporalWorkerDeploymentReconciler) updateVersionConfig(ctx context.Context, l logr.Logger, workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment, deploymentHandler sdkclient.WorkerDeploymentHandle, p *plan) error {
+func (r *TemporalWorkerDeploymentReconciler) updateVersionConfig(ctx context.Context, l logr.Logger, workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment, deploymentHandler sdkclient.WorkerDeploymentHandle, p *plan, temporalState *temporal.TemporalWorkerState) error {
 	vcfg := p.UpdateVersionConfig
 	if vcfg == nil {
 		return nil
@@ -241,16 +242,59 @@ func (r *TemporalWorkerDeploymentReconciler) updateVersionConfig(ctx context.Con
 		// TargetVersion.Status, so it must be current to avoid a one-cycle lag.
 		workerDeploy.Status.TargetVersion.Status = temporaliov1alpha1.VersionStatusCurrent
 	} else {
+		// Skip redundant SetRampingVersion calls to avoid resetting
+		// RampingVersionPercentageChangedTime on the Temporal server, which
+		// would prevent the pause duration from ever elapsing.
+		if vcfg.RampPercentage > 0 &&
+			temporalState != nil &&
+			temporalState.RampingBuildID == vcfg.BuildID &&
+			temporalState.RampPercentage == float32(vcfg.RampPercentage) {
+			l.Info("ramp already applied, skipping", "buildID", vcfg.BuildID, "percentage", vcfg.RampPercentage)
+			return nil
+		}
+		// Also skip if the CRD status already reflects this ramp. This handles the
+		// case where a stale/stuck version keeps reverting to ramping in Temporal's
+		// Describe response despite successful SetRampingVersion calls. Without this
+		// check, the controller would re-apply the ramp every reconcile, resetting
+		// the server-side timer and preventing the pause duration from ever elapsing.
+		if vcfg.RampPercentage > 0 &&
+			workerDeploy.Status.TargetVersion.RampPercentage != nil &&
+			*workerDeploy.Status.TargetVersion.RampPercentage == float32(vcfg.RampPercentage) &&
+			workerDeploy.Status.TargetVersion.RampLastModifiedAt != nil &&
+			workerDeploy.Status.TargetVersion.BuildID == vcfg.BuildID {
+			l.Info("ramp already reflected in CRD status, skipping to preserve pause timer", "buildID", vcfg.BuildID, "percentage", vcfg.RampPercentage)
+			return nil
+		}
+
 		if vcfg.RampPercentage > 0 {
 			l.Info("applying ramp", "buildID", vcfg.BuildID, "percentage", vcfg.RampPercentage)
 		} else {
 			l.Info("deleting ramp", "buildID", vcfg.BuildID)
 		}
 
+		// When displacing a stale ramp (different build ID currently ramping) or
+		// clearing a ramp (percentage=0), bypass conflict detection by not sending
+		// the conflict token. The Temporal server may return success but not persist
+		// changes when a conflict token is provided in these scenarios. Without the
+		// token, the server unconditionally applies the change.
+		conflictToken := vcfg.ConflictToken
+		if vcfg.RampPercentage == 0 ||
+			(temporalState != nil &&
+				temporalState.RampingBuildID != "" &&
+				temporalState.RampingBuildID != vcfg.BuildID) {
+			l.Info("bypassing conflict token for ramp operation", "reason", func() string {
+				if vcfg.RampPercentage == 0 {
+					return "clearing ramp"
+				}
+				return "displacing stale ramp"
+			}(), "staleBuildID", temporalState.RampingBuildID)
+			conflictToken = nil
+		}
+
 		if _, err := deploymentHandler.SetRampingVersion(ctx, sdkclient.WorkerDeploymentSetRampingVersionOptions{
 			BuildID:       vcfg.BuildID,
 			Percentage:    float32(vcfg.RampPercentage),
-			ConflictToken: vcfg.ConflictToken,
+			ConflictToken: conflictToken,
 			Identity:      getControllerIdentity(),
 		}); err != nil {
 			l.Error(err, "unable to set ramping deployment version", "buildID", vcfg.BuildID, "percentage", vcfg.RampPercentage)
@@ -262,6 +306,15 @@ func (r *TemporalWorkerDeploymentReconciler) updateVersionConfig(ctx context.Con
 		// so syncConditions sees the correct state on this reconcile cycle.
 		if vcfg.RampPercentage > 0 {
 			workerDeploy.Status.TargetVersion.Status = temporaliov1alpha1.VersionStatusRamping
+			// Also set RampPercentage and RampLastModifiedAt so the status write
+			// persists these values. On the next reconcile, if a stale ramp prevents
+			// Temporal from reporting the correct ramp, the preserved CRD values
+			// will be used to avoid re-applying (and resetting the pause timer).
+			rampPct := float32(vcfg.RampPercentage)
+			workerDeploy.Status.TargetVersion.RampPercentage = &rampPct
+			now := metav1.Now()
+			workerDeploy.Status.TargetVersion.RampLastModifiedAt = &now
+			workerDeploy.Status.TargetVersion.RampingSince = &now
 		}
 		// When RampPercentage == 0 we are clearing a stale ramp on a different build ID
 		// (see planner: "Reset ramp if needed"). The target version is already Current,
@@ -289,7 +342,7 @@ func (r *TemporalWorkerDeploymentReconciler) updateVersionConfig(ctx context.Con
 	return nil
 }
 
-func (r *TemporalWorkerDeploymentReconciler) executePlan(ctx context.Context, l logr.Logger, workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment, temporalClient sdkclient.Client, p *plan) error {
+func (r *TemporalWorkerDeploymentReconciler) executePlan(ctx context.Context, l logr.Logger, workerDeploy *temporaliov1alpha1.TemporalWorkerDeployment, temporalClient sdkclient.Client, p *plan, temporalState *temporal.TemporalWorkerState) error {
 	if err := r.executeK8sOperations(ctx, l, workerDeploy, p); err != nil {
 		return err
 	}
@@ -300,7 +353,7 @@ func (r *TemporalWorkerDeploymentReconciler) executePlan(ctx context.Context, l 
 		return err
 	}
 
-	if err := r.updateVersionConfig(ctx, l, workerDeploy, deploymentHandler, p); err != nil {
+	if err := r.updateVersionConfig(ctx, l, workerDeploy, deploymentHandler, p, temporalState); err != nil {
 		return err
 	}
 

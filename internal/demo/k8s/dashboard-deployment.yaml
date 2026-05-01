@@ -1,14 +1,14 @@
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: rainbow-dashboard
+  name: rainbow-dashboard-api
   namespace: default
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: rainbow-dashboard
+  name: rainbow-dashboard-api
 rules:
   - apiGroups: ["temporal.io"]
     resources: ["temporalworkerdeployments", "temporalconnections"]
@@ -27,38 +27,38 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: rainbow-dashboard
+  name: rainbow-dashboard-api
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: rainbow-dashboard
+  name: rainbow-dashboard-api
 subjects:
   - kind: ServiceAccount
-    name: rainbow-dashboard
+    name: rainbow-dashboard-api
     namespace: default
 
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: rainbow-dashboard
+  name: rainbow-dashboard-api
   namespace: default
   labels:
-    app: rainbow-dashboard
+    app: rainbow-dashboard-api
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: rainbow-dashboard
+      app: rainbow-dashboard-api
   template:
     metadata:
       labels:
-        app: rainbow-dashboard
+        app: rainbow-dashboard-api
     spec:
-      serviceAccountName: rainbow-dashboard
+      serviceAccountName: rainbow-dashboard-api
       containers:
-        - name: dashboard
-          image: 025066239481.dkr.ecr.us-east-2.amazonaws.com/rainbow-dashboard:latest
+        - name: api
+          image: rainbow-dashboard-api
           imagePullPolicy: Always
           ports:
             - containerPort: 8787
@@ -87,10 +87,10 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: rainbow-dashboard
+  name: rainbow-dashboard-api
   namespace: default
   labels:
-    app: rainbow-dashboard
+    app: rainbow-dashboard-api
 spec:
   type: ClusterIP
   ports:
@@ -99,7 +99,89 @@ spec:
       protocol: TCP
       name: http
   selector:
-    app: rainbow-dashboard
+    app: rainbow-dashboard-api
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rainbow-dashboard-ui-nginx
+  namespace: default
+data:
+  default.conf: |
+    server {
+      listen 80;
+      root /usr/share/nginx/html;
+      index index.html;
+
+      location /healthz {
+        return 200 "ok";
+        add_header Content-Type text/plain;
+      }
+
+      location / {
+        try_files $uri $uri/ /index.html;
+      }
+    }
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rainbow-dashboard-ui
+  namespace: default
+  labels:
+    app: rainbow-dashboard-ui
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rainbow-dashboard-ui
+  template:
+    metadata:
+      labels:
+        app: rainbow-dashboard-ui
+    spec:
+      containers:
+        - name: ui
+          image: rainbow-dashboard-ui
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 80
+              name: http
+          volumeMounts:
+            - name: nginx-config
+              mountPath: /etc/nginx/conf.d/default.conf
+              subPath: default.conf
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+      volumes:
+        - name: nginx-config
+          configMap:
+            name: rainbow-dashboard-ui-nginx
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rainbow-dashboard-ui
+  namespace: default
+  labels:
+    app: rainbow-dashboard-ui
+spec:
+  type: ClusterIP
+  ports:
+    - port: 80
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    app: rainbow-dashboard-ui
 
 ---
 apiVersion: networking.k8s.io/v1
@@ -114,8 +196,10 @@ metadata:
     alb.ingress.kubernetes.io/ssl-redirect: "443"
     # Set this to your ACM certificate ARN before applying.
     alb.ingress.kubernetes.io/certificate-arn: "arn:aws:acm:us-east-2:025066239481:certificate/f1084339-83cd-471a-964a-877799ef8239"
-    alb.ingress.kubernetes.io/healthcheck-path: /api/state
+    alb.ingress.kubernetes.io/subnets: subnet-020cbb1d237801119,subnet-0c6238d501a8f9328
+    alb.ingress.kubernetes.io/healthcheck-path: /healthz
     alb.ingress.kubernetes.io/success-codes: "200"
+    alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=30,load_balancing.cross_zone.enabled=true
 spec:
   ingressClassName: alb
   rules:
@@ -133,13 +217,13 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: rainbow-dashboard
+                name: rainbow-dashboard-api
                 port:
                   number: 8787
           - path: /
             pathType: Prefix
             backend:
               service:
-                name: rainbow-dashboard
+                name: rainbow-dashboard-ui
                 port:
-                  number: 8787
+                  number: 80

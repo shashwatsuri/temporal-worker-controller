@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rainbow-release
+  labels:
+    app: rainbow-release
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rainbow-release
+  template:
+    metadata:
+      labels:
+        app: rainbow-release
+    spec:
+      serviceAccountName: rainbow-demo-runner
+      restartPolicy: Always
+      volumes:
+        - name: scripts
+          configMap:
+            name: rainbow-release-scripts
+            defaultMode: 0755
+      containers:
+        - name: release
+          image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args: ["while true; do /opt/scripts/run_release_once.sh || true; sleep \"$INTERVAL_SECONDS\"; done"]
+          volumeMounts:
+            - name: scripts
+              mountPath: /opt/scripts
+              readOnly: true
+          env:
+            - name: INTERVAL_SECONDS
+              value: {{ .Values.release.intervalSeconds | quote }}
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: RELEASE_NAME
+              value: {{ .Values.release.name | quote }}
+            - name: AWS_REGION
+              value: {{ .Values.aws.region | quote }}
+            - name: ECR_REPO
+              value: {{ .Values.release.ecrRepo | quote }}
+            - name: SOURCE_TAG
+              value: {{ .Values.release.sourceTag | quote }}
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi

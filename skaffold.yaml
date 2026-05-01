@@ -51,6 +51,9 @@ profiles:
   # Build and deploy the helloworld Custom Resource to the local k8s cluster  
   - name: helloworld-worker
     build:
+      tagPolicy:
+        envTemplate:
+          template: "latest"
       artifacts:
         - image: helloworld
           context: internal/demo
@@ -77,47 +80,25 @@ profiles:
             valuesFiles:
               - internal/demo/helloworld/helm/helloworld/values.yaml
 
-  # Build the rainbow dashboard container image
+  # Build and deploy the rainbow dashboard (API + UI)
   - name: dashboard
     build:
       artifacts:
-        - image: rainbow-dashboard
+        - image: rainbow-dashboard-api
           context: .
           docker:
             dockerfile: internal/demo/Dockerfile.dashboard
-
-  - name: rainbow-release
-    build:
-      artifacts:
-        - image: rainbow-release-manager
-          context: internal/demo
+        - image: rainbow-dashboard-ui
+          context: internal/demo/dashboard
           docker:
             dockerfile: Dockerfile
             buildArgs:
-              DD_GIT_COMMIT_SHA: "{{ .IMAGE_TAG }}"
-              DD_GIT_REPOSITORY_URL: "github.com/shashwatsuri/temporal-worker-controller"
-              WORKER: "release"
-        - image: rainbow-release-job
-          context: .
-          docker:
-            dockerfile: internal/demo/Dockerfile.release-job
+              VITE_API_BASE_URL: ""
     manifests:
-      helm:
-        releases:
-          - name: rainbow-release-manager
-            chartPath: internal/demo/release/helm/release-manager
-            setValueTemplates:
-              manager.image.repository: "{{ .IMAGE_REPO_rainbow_release_manager }}"
-              manager.image.tag: "{{ .IMAGE_TAG_rainbow_release_manager }}"
-              job.image.repository: "{{ .IMAGE_REPO_rainbow_release_job }}"
-              job.image.tag: "{{ .IMAGE_TAG_rainbow_release_job }}"
-              temporal.namespace: "{{ .TEMPORAL_NAMESPACE }}"
-              temporal.address: "{{ .TEMPORAL_ADDRESS }}"
-              temporal.mtlsSecretName: "{{ .TEMPORAL_MTLS_SECRET_NAME }}"
-              temporal.apiKey.name: "{{ .TEMPORAL_API_KEY_SECRET_NAME }}"
-              temporal.apiKey.key: "{{ .TEMPORAL_API_KEY_SECRET_KEY }}"
-            valuesFiles:
-              - internal/demo/release/helm/release-manager/values.yaml
+      rawYaml:
+        - internal/demo/k8s/dashboard-deployment.yaml
+
+
 
   # Architecture override profile for EKS/x86_64 clusters.
   # Use in combination with another profile, e.g. --profile worker-controller,eks-amd64
@@ -157,9 +138,11 @@ profiles:
               aws.roleArn: arn:aws:iam::025066239481:role/rainbow-version-generator-role
               aws.region: us-east-2
               release.name: helloworld
+              release.intervalSeconds: "90"
               release.repoUrl: https://github.com/shashwatsuri/temporal-worker-controller
               release.repoRef: main
               release.worker: helloworld
+              temporal.workerDeployment: default/helloworld
             valuesFiles:
               - internal/demo/k8s/demo-loop-runner/values.yaml
 
