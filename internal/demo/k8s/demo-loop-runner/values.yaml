@@ -19,7 +19,7 @@ traffic:
   workflowsPerRun: "6"
 
 cleanup:
-  intervalSeconds: "30"
+  intervalSeconds: "120"
 
 temporal:
   address: ""

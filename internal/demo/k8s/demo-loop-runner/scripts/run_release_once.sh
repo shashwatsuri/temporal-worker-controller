@@ -34,12 +34,33 @@ if [ -z "$MANIFEST" ] || [ "$MANIFEST" = "None" ]; then
   exit 1
 fi
 
-aws ecr put-image \
+# Clean up old tags to stay under ECR's 1000-tag-per-image limit.
+# Keep only the 20 most recent hex tags (plus latest/gatefix-*).
+OLD_TAGS=$(aws ecr describe-images \
+  --region "$AWS_REGION" \
+  --repository-name "$REPO_NAME" \
+  --image-ids imageTag="$SOURCE_TAG" \
+  --query 'imageDetails[0].imageTags' \
+  --output json 2>/dev/null | \
+  jq -r '.[] | select(. != "latest" and (startswith("gatefix") | not))' | \
+  tail -n +21) || true
+
+if [ -n "$OLD_TAGS" ]; then
+  echo "$OLD_TAGS" | jq -R -s 'split("\n") | map(select(. != "")) | map({"imageTag": .})' | \
+    aws ecr batch-delete-image \
+      --region "$AWS_REGION" \
+      --repository-name "$REPO_NAME" \
+      --image-ids file:///dev/stdin >/dev/null 2>&1 || true
+fi
+
+PUT_RESULT=$(aws ecr put-image \
   --region "$AWS_REGION" \
   --repository-name "$REPO_NAME" \
   --image-tag "$NEW_TAG" \
-  --image-manifest "$MANIFEST" \
-  >/dev/null 2>&1 || true  # Ignore "already exists" errors
+  --image-manifest "$MANIFEST" 2>&1) || {
+  echo "[$TIMESTAMP] ERROR: put-image failed: $PUT_RESULT"
+  exit 1
+}
 
 echo "[$TIMESTAMP] Image tagged successfully: $ECR_REPO:$NEW_TAG"
 
