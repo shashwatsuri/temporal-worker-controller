@@ -569,6 +569,15 @@ func collectExecutions(ctx context.Context, namespace, name string, since time.T
 	}
 	defer cleanupTempFiles(cfg.TempFiles)
 
+	// Apply an overlap buffer to cover:
+	//   1. Temporal Cloud search-attribute indexing lag (~2-3s)
+	//   2. The gap between when the server queries Temporal and when the client
+	//      records receivedAt as the next `since` (~2-5s round-trip)
+	// Without this, workflows started in that window are permanently missed.
+	// The frontend scheduledIds set deduplicates re-seen IDs safely.
+	const overlapBuffer = 12 * time.Second
+	since = since.Add(-overlapBuffer)
+
 	// Cap the retention window at 5 minutes regardless of since.
 	retentionCutoff := time.Now().UTC().Add(-5 * time.Minute)
 	if since.IsZero() || since.Before(retentionCutoff) {
@@ -576,13 +585,6 @@ func collectExecutions(ctx context.Context, namespace, name string, since time.T
 	}
 
 	deploymentKey := fmt.Sprintf("%s/%s", namespace, name)
-	query := fmt.Sprintf(`ExecutionStatus="Running" AND TemporalWorkerDeployment=%q AND StartTime > '%s'`,
-		deploymentKey, since.UTC().Format(time.RFC3339))
-
-	executions, err := temporalWorkflowList(ctx, cfg, query, deploymentKey)
-	if err != nil {
-		return executionsAPIResponse{}, fmt.Errorf("failed to list workflows: %w", err)
-	}
 
 	// Determine if a ramp is active: target exists, has rampPercentage set, and is a different
 	// version from current (same-buildID means ramp just completed).
@@ -594,8 +596,6 @@ func collectExecutions(ctx context.Context, namespace, name string, since time.T
 	targetRampPct := twd.Status.TargetVersion.RampPercentage
 	isRamping := targetBID != "" && targetBID != currentBID && targetRampPct != nil
 
-	versions := make(map[string]versionInfo)
-
 	// runningCount fetches the live running workflow count for a specific version build ID.
 	runningCount := func(bid string) int {
 		versionKey := fmt.Sprintf("%s:%s", deploymentKey, bid)
@@ -603,6 +603,8 @@ func collectExecutions(ctx context.Context, namespace, name string, since time.T
 		n, _ := temporalWorkflowCount(ctx, cfg, q)
 		return n
 	}
+
+	versions := make(map[string]versionInfo)
 
 	// Current (active) version.
 	if currentBID != "" {
@@ -656,6 +658,37 @@ func collectExecutions(ctx context.Context, namespace, name string, since time.T
 			Ramping: 0,
 		}
 	}
+
+	// Build the set of recognized buildIDs so we can filter the executions list.
+	knownBIDs := make(map[string]bool, len(versions))
+	for bid := range versions {
+		knownBIDs[bid] = true
+	}
+
+	// Query executions started in the since-window. We intentionally omit
+	// ExecutionStatus="Running" so that short-lived workflows on the ramping
+	// version (which may complete in seconds) are still captured as dots.
+	// Orphan executions with version IDs that don't match any current TWD
+	// buildID (e.g. long-format IDs from a previous build generation) are
+	// filtered out below so they don't produce invisible stray dots.
+	query := fmt.Sprintf(`TemporalWorkerDeployment=%q AND StartTime > '%s'`,
+		deploymentKey, since.UTC().Format(time.RFC3339))
+
+	executions, err := temporalWorkflowList(ctx, cfg, query, deploymentKey)
+	if err != nil {
+		return executionsAPIResponse{}, fmt.Errorf("failed to list workflows: %w", err)
+	}
+
+	// Drop executions whose version doesn't map to a known TWD buildID.
+	// This removes orphan workflows from previous build generations and
+	// workflows where TemporalWorkerDeploymentVersion hasn't been indexed yet.
+	filtered := executions[:0]
+	for _, e := range executions {
+		if knownBIDs[e.Version] {
+			filtered = append(filtered, e)
+		}
+	}
+	executions = filtered
 
 	return executionsAPIResponse{
 		Executions: executions,

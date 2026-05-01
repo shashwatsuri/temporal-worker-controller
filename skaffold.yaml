@@ -51,6 +51,9 @@ profiles:
   # Build and deploy the helloworld Custom Resource to the local k8s cluster  
   - name: helloworld-worker
     build:
+      tagPolicy:
+        envTemplate:
+          template: "latest"
       artifacts:
         - image: helloworld
           context: internal/demo

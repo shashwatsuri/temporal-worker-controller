@@ -128,8 +128,10 @@ done
 
 echo "[$TIMESTAMP] Temporal cleanup: deleted=$DELETED skipped=$SKIPPED has_workflows=$HAS_WORKFLOWS failed=$FAILED"
 
-# Catch-all: terminate any running workflows NOT on current or target version.
-# This handles workflows pinned to versions already deleted from Temporal.
+# Catch-all: terminate any running workflows NOT on current, target, or still-draining versions.
+# "Still-draining" = a K8s Deployment exists for that build ID, meaning the controller
+# is still keeping workers alive to process in-flight workflows.  We must not terminate
+# those — they are legitimately completing their work.
 CATCHALL_QUERY="ExecutionStatus='Running' AND TemporalWorkerDeployment='${WORKER_DEPLOYMENT_NAME}'"
 if [ -n "$CURRENT_BUILD_ID" ]; then
   CATCHALL_QUERY="$CATCHALL_QUERY AND TemporalWorkerDeploymentVersion != '${WORKER_DEPLOYMENT_NAME}:${CURRENT_BUILD_ID}'"
@@ -137,6 +139,23 @@ fi
 if [ -n "$TARGET_BUILD_ID" ]; then
   CATCHALL_QUERY="$CATCHALL_QUERY AND TemporalWorkerDeploymentVersion != '${WORKER_DEPLOYMENT_NAME}:${TARGET_BUILD_ID}'"
 fi
+
+# Exclude ALL versions that still have a K8s Deployment, regardless of replica count.
+# A deployment can be at spec.replicas=0 (controller scaledown step) but still within the
+# deleteDelay window, meaning it may have running workflows we must not terminate.
+# The per-version loop above already handles these correctly; the catch-all must mirror it.
+DRAINING_BUILD_IDS=$(kubectl get deployments -n "$NAMESPACE" \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null \
+  | awk -v prefix="${RELEASE_NAME}-" 'substr($0, 1, length(prefix)) == prefix { print substr($0, length(prefix)+1) }' \
+  || true)
+
+for DRAINING_ID in $DRAINING_BUILD_IDS; do
+  # Skip current and target (already excluded above)
+  if [ "$DRAINING_ID" = "$CURRENT_BUILD_ID" ] || [ "$DRAINING_ID" = "$TARGET_BUILD_ID" ]; then
+    continue
+  fi
+  CATCHALL_QUERY="$CATCHALL_QUERY AND TemporalWorkerDeploymentVersion != '${WORKER_DEPLOYMENT_NAME}:${DRAINING_ID}'"
+done
 
 ORPHAN_COUNT=$(temporal workflow count \
   --query "$CATCHALL_QUERY" \
