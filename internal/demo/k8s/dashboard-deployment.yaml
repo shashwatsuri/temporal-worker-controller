@@ -56,6 +56,8 @@ spec:
         app: rainbow-dashboard-api
     spec:
       serviceAccountName: rainbow-dashboard-api
+      nodeSelector:
+        kubernetes.io/arch: amd64
       containers:
         - name: api
           image: 025066239481.dkr.ecr.us-east-2.amazonaws.com/rainbow-dashboard-api:latest
@@ -142,6 +144,8 @@ spec:
       labels:
         app: rainbow-dashboard-ui
     spec:
+      nodeSelector:
+        kubernetes.io/arch: amd64
       containers:
         - name: ui
           image: 025066239481.dkr.ecr.us-east-2.amazonaws.com/rainbow-dashboard-ui:latest
