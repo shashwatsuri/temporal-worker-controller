@@ -395,10 +395,14 @@ func collectState(ctx context.Context, namespace, name string) (apiState, error)
 		if drainingIDs[cards[i].BuildID] {
 			cards[i].Draining = true
 		}
-		// Normalize status to "Ramping" for the target during an active ramp,
-		// regardless of what the controller reports (some emit "Draining" mid-ramp).
+		isTargetRole := strings.Contains(cards[i].Role, "target")
+		isCurrentRole := strings.Contains(cards[i].Role, "current")
+		// Normalize status to "Ramping" for the active ramp target.
 		if rampingTargetID != "" && cards[i].BuildID == rampingTargetID {
 			cards[i].Status = "Ramping"
+		} else if isTargetRole && !isCurrentRole && cards[i].BuildID != rampingTargetID {
+			// Target that isn't ramping yet — show as Inactive so the UI renders it.
+			cards[i].Status = "Inactive"
 		}
 	}
 
@@ -469,21 +473,23 @@ func collectState(ctx context.Context, namespace, name string) (apiState, error)
 	state.Versions = cards
 
 	// Filter versions:
-	// - Always hide deprecated versions the controller has fully drained.
-	// - Hide target-only versions that aren't actively ramping and have no workflows
-	//   (e.g. new deployments briefly showing as "Draining" before they register).
-	// - When we have reliable workflow data, hide anything with 0 active workflows.
+	// - Always hide Drained deprecated versions.
+	// - Always show current and target cards (inactive target should be visible).
+	// - For deprecated/draining cards, hide if no active workflows (when data is available).
 	{
 		filtered := make([]versionCard, 0, len(cards))
 		for _, c := range cards {
 			if strings.EqualFold(c.Status, "Drained") {
 				continue
 			}
-			isCurrentRole := strings.Contains(c.Role, "current")
-			isTargetOnly := strings.Contains(c.Role, "target") && !isCurrentRole
-			if isTargetOnly && c.BuildID != rampingTargetID && c.ActiveWorkflowCount <= 0 {
+			isCurrent := strings.Contains(c.Role, "current")
+			isTarget := strings.Contains(c.Role, "target")
+			// Never hide current or target versions — they're always relevant.
+			if isCurrent || isTarget {
+				filtered = append(filtered, c)
 				continue
 			}
+			// For deprecated/draining: hide when no active workflows.
 			if workflowTotal > 0 && c.ActiveWorkflowCount <= 0 {
 				continue
 			}
@@ -563,76 +569,90 @@ func collectExecutions(ctx context.Context, namespace, name string, since time.T
 	}
 	defer cleanupTempFiles(cfg.TempFiles)
 
-	deploymentKey := fmt.Sprintf("%s/%s", namespace, name)
-	query := fmt.Sprintf(`ExecutionStatus="Running" AND TemporalWorkerDeployment=%q`, deploymentKey)
-	if !since.IsZero() {
-		query += fmt.Sprintf(` AND StartTime > '%s'`, since.UTC().Format(time.RFC3339))
+	// Cap the retention window at 5 minutes regardless of since.
+	retentionCutoff := time.Now().UTC().Add(-5 * time.Minute)
+	if since.IsZero() || since.Before(retentionCutoff) {
+		since = retentionCutoff
 	}
+
+	deploymentKey := fmt.Sprintf("%s/%s", namespace, name)
+	query := fmt.Sprintf(`ExecutionStatus="Running" AND TemporalWorkerDeployment=%q AND StartTime > '%s'`,
+		deploymentKey, since.UTC().Format(time.RFC3339))
 
 	executions, err := temporalWorkflowList(ctx, cfg, query, deploymentKey)
 	if err != nil {
 		return executionsAPIResponse{}, fmt.Errorf("failed to list workflows: %w", err)
 	}
 
-	// Build version info from TWD status
+	// Determine if a ramp is active: target exists, has rampPercentage set, and is a different
+	// version from current (same-buildID means ramp just completed).
+	currentBID := ""
+	if twd.Status.CurrentVersion != nil {
+		currentBID = twd.Status.CurrentVersion.BuildID
+	}
+	targetBID := twd.Status.TargetVersion.BuildID
+	targetRampPct := twd.Status.TargetVersion.RampPercentage
+	isRamping := targetBID != "" && targetBID != currentBID && targetRampPct != nil
+
 	versions := make(map[string]versionInfo)
 
-	// Count running workflows per version
-	runningByVersion := make(map[string]int)
-	for _, e := range executions {
-		if e.Version != "" {
-			runningByVersion[e.Version]++
+	// runningCount fetches the live running workflow count for a specific version build ID.
+	runningCount := func(bid string) int {
+		versionKey := fmt.Sprintf("%s:%s", deploymentKey, bid)
+		q := fmt.Sprintf(`ExecutionStatus="Running" AND TemporalWorkerDeploymentVersion=%q`, versionKey)
+		n, _ := temporalWorkflowCount(ctx, cfg, q)
+		return n
+	}
+
+	// Current (active) version.
+	if currentBID != "" {
+		activeRamp := 100
+		if isRamping {
+			activeRamp = 100 - int(*targetRampPct)
+		}
+		versions[currentBID] = versionInfo{
+			Status:  versionStatusActive,
+			Running: runningCount(currentBID),
+			Ramping: activeRamp,
 		}
 	}
 
-	if twd.Status.CurrentVersion != nil && twd.Status.CurrentVersion.BuildID != "" {
-		bid := twd.Status.CurrentVersion.BuildID
-		ramp := 100
-		if twd.Status.TargetVersion.BuildID != "" && twd.Status.TargetVersion.RampPercentage != nil {
-			ramp = 100 - int(*twd.Status.TargetVersion.RampPercentage)
+	// Target version.
+	if targetBID != "" && targetBID != currentBID {
+		var status versionStatus
+		ramp := 0
+		if isRamping {
+			status = versionStatusRamping
+			ramp = int(*targetRampPct)
+		} else {
+			status = versionStatusInactive
 		}
-		versions[bid] = versionInfo{
-			Status:  versionStatusActive,
-			Running: runningByVersion[bid],
+		versions[targetBID] = versionInfo{
+			Status:  status,
+			Running: runningCount(targetBID),
 			Ramping: ramp,
 		}
 	}
 
-	if twd.Status.TargetVersion.BuildID != "" {
-		bid := twd.Status.TargetVersion.BuildID
-		ramp := 0
-		status := versionStatusInactive
-		switch strings.ToLower(twd.Status.TargetVersion.Status) {
-		case "ramping":
-			status = versionStatusRamping
-			if twd.Status.TargetVersion.RampPercentage != nil {
-				ramp = int(*twd.Status.TargetVersion.RampPercentage)
-			}
-		case "current":
-			status = versionStatusActive
-			ramp = 100
-		}
-		// Don't overwrite if already added as current
-		if _, exists := versions[bid]; !exists {
-			versions[bid] = versionInfo{
-				Status:  status,
-				Running: runningByVersion[bid],
-				Ramping: ramp,
-			}
-		}
-	}
-
+	// Deprecated versions: only include those the TWD considers still Draining (not Drained).
+	// Drained means the controller considers the version done even if some long-running workflows
+	// are still executing — matching the /api/state filter behaviour.
+	// Also skip any buildID that is already represented as current or target, which can happen
+	// transiently during deployment transitions before the controller reconciles all fields.
 	for _, v := range twd.Status.DeprecatedVersion {
-		if v.BuildID == "" {
+		if v.BuildID == "" || strings.EqualFold(v.Status, "Drained") {
 			continue
 		}
-		// Only include deprecated versions that have active workflows.
-		if runningByVersion[v.BuildID] <= 0 {
+		if v.BuildID == currentBID || v.BuildID == targetBID {
+			continue
+		}
+		n := runningCount(v.BuildID)
+		if n <= 0 {
 			continue
 		}
 		versions[v.BuildID] = versionInfo{
 			Status:  versionStatusDraining,
-			Running: runningByVersion[v.BuildID],
+			Running: n,
 			Ramping: 0,
 		}
 	}
