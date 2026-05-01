@@ -58,7 +58,7 @@ spec:
       serviceAccountName: rainbow-dashboard-api
       containers:
         - name: api
-          image: 025066239481.dkr.ecr.us-east-2.amazonaws.com/rainbow-dashboard:latest
+          image: 025066239481.dkr.ecr.us-east-2.amazonaws.com/rainbow-dashboard-api:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 8787

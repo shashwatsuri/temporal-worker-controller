@@ -77,14 +77,23 @@ profiles:
             valuesFiles:
               - internal/demo/helloworld/helm/helloworld/values.yaml
 
-  # Build the rainbow dashboard container image
+  # Build and deploy the rainbow dashboard (API + UI)
   - name: dashboard
     build:
       artifacts:
-        - image: rainbow-dashboard
+        - image: rainbow-dashboard-api
           context: .
           docker:
             dockerfile: internal/demo/Dockerfile.dashboard
+        - image: rainbow-dashboard-ui
+          context: internal/demo/dashboard
+          docker:
+            dockerfile: Dockerfile
+            buildArgs:
+              VITE_API_BASE_URL: "{{ .VITE_API_BASE_URL }}"
+    manifests:
+      rawYaml:
+        - internal/demo/k8s/dashboard-deployment.yaml
 
 
 

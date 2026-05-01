@@ -104,7 +104,7 @@ if ! "${AWS_CMD[@]}" sts get-caller-identity >/dev/null 2>&1; then
   exit 1
 fi
 
-for repo in temporal-worker-controller helloworld rainbow-dashboard "$DEMO_RUNNER_REPO_NAME"; do
+for repo in temporal-worker-controller helloworld rainbow-dashboard-api rainbow-dashboard-ui "$DEMO_RUNNER_REPO_NAME"; do
   "${AWS_CMD[@]}" ecr describe-repositories --repository-names "$repo" >/dev/null 2>&1 || \
     "${AWS_CMD[@]}" ecr create-repository --repository-name "$repo" >/dev/null
   echo "ECR repo ready: $repo"
@@ -143,8 +143,14 @@ SKAFFOLD_DEFAULT_REPO="$ECR_BASE" skaffold run \
   --platform "$TARGET_PLATFORM" \
   --profile "helloworld-worker,${SKAFFOLD_ARCH_PROFILE}"
 
-echo "Building and pushing dashboard image"
-docker buildx build --platform "$TARGET_PLATFORM" -t "$ECR_BASE/rainbow-dashboard:latest" -f internal/demo/Dockerfile.dashboard . --push
+echo "Building and pushing dashboard API image"
+docker buildx build --platform "$TARGET_PLATFORM" -t "$ECR_BASE/rainbow-dashboard-api:latest" -f internal/demo/Dockerfile.dashboard . --push
+
+echo "Building and pushing dashboard UI image"
+docker buildx build --platform "$TARGET_PLATFORM" \
+  --build-arg VITE_API_BASE_URL="" \
+  -t "$ECR_BASE/rainbow-dashboard-ui:latest" \
+  internal/demo/dashboard --push
 
 DEMO_RUNNER_TAG="demo-loop-$(date +%Y%m%d%H%M%S)"
 DEMO_RUNNER_IMAGE="${DEMO_RUNNER_IMAGE_REPO}:${DEMO_RUNNER_TAG}"
@@ -153,15 +159,8 @@ echo "Building and pushing unified demo runner image"
 docker buildx build --platform "$TARGET_PLATFORM" -t "$DEMO_RUNNER_IMAGE" -f internal/demo/Dockerfile.release-job . --push
 
 echo "Applying dashboard manifests"
-# Cleanup from older script behavior: remove literal NAMESPACE env so apply with valueFrom succeeds.
-kubectl -n "$DASHBOARD_NAMESPACE" set env deployment/rainbow-dashboard NAMESPACE- >/dev/null 2>&1 || true
 kubectl apply -f internal/demo/k8s/dashboard-deployment.yaml
-kubectl -n "$DASHBOARD_NAMESPACE" set image deployment/rainbow-dashboard \
-  dashboard="$ECR_BASE/rainbow-dashboard:latest"
-kubectl -n "$DASHBOARD_NAMESPACE" patch deployment rainbow-dashboard --type strategic -p \
-  '{"spec":{"template":{"spec":{"containers":[{"name":"dashboard","imagePullPolicy":"Always"}]}}}}'
-kubectl -n "$DASHBOARD_NAMESPACE" patch deployment rainbow-dashboard --type strategic -p \
-  "{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"dashboard\",\"args\":[\"--namespace\",\"$DASHBOARD_NAMESPACE\",\"--name\",\"$DASHBOARD_NAME\",\"--port\",\"8787\"]}]}}}}"
+kubectl -n "$DASHBOARD_NAMESPACE" rollout restart deployment/rainbow-dashboard-api deployment/rainbow-dashboard-ui
 
 echo "Suspending legacy demo triggers"
 kubectl -n "$DEMO_NAMESPACE" patch cronjob traffic-generator --type merge -p '{"spec":{"suspend":true}}' >/dev/null 2>&1 || true
@@ -211,12 +210,13 @@ sed \
 kubectl -n "$DEMO_NAMESPACE" rollout status deployment/rainbow-demo-runner --timeout=180s
 
 if [[ "$EXPOSE_PUBLIC" == "true" ]]; then
-  kubectl -n "$DASHBOARD_NAMESPACE" patch svc rainbow-dashboard -p '{"spec":{"type":"LoadBalancer"}}'
-  echo "Dashboard service set to LoadBalancer."
-  echo "Get external endpoint with: kubectl -n $DASHBOARD_NAMESPACE get svc rainbow-dashboard"
+  kubectl -n "$DASHBOARD_NAMESPACE" patch svc rainbow-dashboard-ui -p '{"spec":{"type":"LoadBalancer"}}'
+  echo "Dashboard UI service set to LoadBalancer."
+  echo "Get external endpoint with: kubectl -n $DASHBOARD_NAMESPACE get svc rainbow-dashboard-ui"
 else
-  echo "Dashboard service left as ClusterIP."
-  echo "Use: kubectl -n $DASHBOARD_NAMESPACE port-forward svc/rainbow-dashboard 8787:8787"
+  echo "Dashboard services left as ClusterIP."
+  echo "UI:  kubectl -n $DASHBOARD_NAMESPACE port-forward svc/rainbow-dashboard-ui 8080:80"
+  echo "API: kubectl -n $DASHBOARD_NAMESPACE port-forward svc/rainbow-dashboard-api 8787:8787"
 fi
 
 echo "Done."
