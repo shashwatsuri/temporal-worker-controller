@@ -78,16 +78,16 @@ for BUILD_ID in $ALL_VERSIONS; do
     --api-key "$TEMPORAL_API_KEY" \
     --tls 2>/dev/null | grep -oE '[0-9]+' || echo "0")
 
-  # First, delete the K8s Deployment so pollers disconnect
+  # If K8s deployment still exists, the controller manages its lifecycle via scaledownDelay.
+  # Only proceed to Temporal cleanup for versions whose K8s deployment is already gone.
   K8S_DEPLOY="${RELEASE_NAME}-${BUILD_ID}"
   if kubectl get deployment "$K8S_DEPLOY" -n "$NAMESPACE" >/dev/null 2>&1; then
     if [ "$RUNNING_COUNT" -gt 0 ] 2>/dev/null; then
       echo "[$TIMESTAMP] Keeping $BUILD_ID (has K8s deployment and $RUNNING_COUNT running workflows)"
       HAS_WORKFLOWS=$((HAS_WORKFLOWS + 1))
     else
-      echo "[$TIMESTAMP] Deleting K8s deployment $K8S_DEPLOY (will delete version next cycle)"
-      kubectl delete deployment "$K8S_DEPLOY" -n "$NAMESPACE" --ignore-not-found >/dev/null 2>&1
-      FAILED=$((FAILED + 1))
+      echo "[$TIMESTAMP] Skipping $BUILD_ID (K8s deployment exists, controller will handle scaledown)"
+      SKIPPED=$((SKIPPED + 1))
     fi
     continue
   fi
