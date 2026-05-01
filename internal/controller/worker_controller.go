@@ -251,6 +251,28 @@ func (r *TemporalWorkerDeploymentReconciler) Reconcile(ctx context.Context, req 
 	}
 	// Preserve conditions that were set during this reconciliation
 	status.Conditions = workerDeploy.Status.Conditions
+
+	// If a stale ramp in Temporal prevents the target's ramp fields from being
+	// populated (because Temporal shows a different buildID as ramping), but the
+	// previous CRD status had valid ramp data for this same target, preserve it.
+	// This prevents the planner from re-applying the ramp every cycle (which
+	// would reset the server-side pause timer and block promotion).
+	prevStatus := workerDeploy.Status
+	if status.TargetVersion.RampPercentage == nil &&
+		prevStatus.TargetVersion.RampPercentage != nil &&
+		prevStatus.TargetVersion.RampLastModifiedAt != nil &&
+		prevStatus.TargetVersion.BuildID == status.TargetVersion.BuildID &&
+		temporalState != nil &&
+		temporalState.RampingBuildID != "" &&
+		temporalState.RampingBuildID != status.TargetVersion.BuildID {
+		l.V(1).Info("preserving ramp status from previous cycle due to stale Temporal ramp",
+			"targetBuildID", status.TargetVersion.BuildID,
+			"staleRampBuildID", temporalState.RampingBuildID)
+		status.TargetVersion.RampPercentage = prevStatus.TargetVersion.RampPercentage
+		status.TargetVersion.RampLastModifiedAt = prevStatus.TargetVersion.RampLastModifiedAt
+		status.TargetVersion.RampingSince = prevStatus.TargetVersion.RampingSince
+	}
+
 	workerDeploy.Status = *status
 
 	// TODO(jlegrone): Set defaults via webhook rather than manually
@@ -271,7 +293,7 @@ func (r *TemporalWorkerDeploymentReconciler) Reconcile(ctx context.Context, req 
 	}
 
 	// Execute the plan, handling any errors
-	if err := r.executePlan(ctx, l, &workerDeploy, temporalClient, plan); err != nil {
+	if err := r.executePlan(ctx, l, &workerDeploy, temporalClient, plan, temporalState); err != nil {
 		r.recordWarningAndSetBlocked(ctx, &workerDeploy,
 			ReasonPlanExecutionFailed,
 			fmt.Sprintf("Unable to execute reconciliation plan: %v", err),
