@@ -426,7 +426,7 @@ func collectState(ctx context.Context, namespace, name string) (apiState, error)
 	pinnedLikely := false
 	for _, c := range cards {
 		s := strings.ToLower(c.Status)
-		if c.BuildID != "" && (s == "current" || s == "ramping" || s == "draining") {
+		if c.BuildID != "" && (s == "current" || s == "ramping" || s == "draining" || c.ReadyReplicas > 0) {
 			activeByBuildID[c.BuildID] = struct{}{}
 		}
 		if s == "draining" {
@@ -463,12 +463,13 @@ func collectState(ctx context.Context, namespace, name string) (apiState, error)
 	}
 	state.Versions = cards
 
-	// Hide any version with 0 active workflows — cards appear when a workflow
-	// starts on them and disappear when all finish, including current.
+	// Hide versions that have no active workflows AND no running K8s replicas.
+	// Versions with active K8s deployments (replicas > 0) remain visible even
+	// after their workflows finish — this shows the full rainbow of active pollers.
 	if workflowTotal > 0 {
 		filtered := make([]versionCard, 0, len(cards))
 		for _, c := range cards {
-			if c.ActiveWorkflowCount <= 0 {
+			if c.ActiveWorkflowCount <= 0 && c.Replicas <= 0 {
 				continue
 			}
 			filtered = append(filtered, c)
@@ -899,11 +900,16 @@ func buildCard(ctx context.Context, role string, v versionRef) versionCard {
 			ns = "default"
 		}
 		card.Deployment = fmt.Sprintf("%s/%s", ns, v.Deployment.Name)
-		var dep deploymentResource
-		err := kubectlJSON(ctx, &dep, "-n", ns, "get", "deployment", v.Deployment.Name, "-o", "json")
-		if err == nil {
-			card.Replicas = dep.Status.Replicas
-			card.ReadyReplicas = dep.Status.ReadyReplicas
+		// Only fetch individual deployment status for current/target (not deprecated).
+		// Deprecated versions get their replica data from mergeLiveDeploymentData's
+		// batch query, avoiding 9+ sequential kubectl calls that eat into the context deadline.
+		if role != "deprecated" {
+			var dep deploymentResource
+			err := kubectlJSON(ctx, &dep, "-n", ns, "get", "deployment", v.Deployment.Name, "-o", "json")
+			if err == nil {
+				card.Replicas = dep.Status.Replicas
+				card.ReadyReplicas = dep.Status.ReadyReplicas
+			}
 		}
 	}
 	return card
