@@ -386,7 +386,7 @@ func collectState(ctx context.Context, namespace, name string) (apiState, error)
 
 	cards = mergeLiveDeploymentData(ctx, namespace, name, cards, cardByBuildID)
 
-	newWorkflowPcts, drainingIDs := computeTraffic(cards)
+	newWorkflowPcts, drainingIDs, rampingTargetID := computeTraffic(cards)
 	for i := range cards {
 		if pct, ok := newWorkflowPcts[cards[i].BuildID]; ok {
 			v := pct
@@ -394,6 +394,11 @@ func collectState(ctx context.Context, namespace, name string) (apiState, error)
 		}
 		if drainingIDs[cards[i].BuildID] {
 			cards[i].Draining = true
+		}
+		// Normalize status to "Ramping" for the target during an active ramp,
+		// regardless of what the controller reports (some emit "Draining" mid-ramp).
+		if rampingTargetID != "" && cards[i].BuildID == rampingTargetID {
+			cards[i].Status = "Ramping"
 		}
 	}
 
@@ -426,7 +431,7 @@ func collectState(ctx context.Context, namespace, name string) (apiState, error)
 	pinnedLikely := false
 	for _, c := range cards {
 		s := strings.ToLower(c.Status)
-		if c.BuildID != "" && (s == "current" || s == "ramping" || s == "draining" || c.ReadyReplicas > 0) {
+		if c.BuildID != "" && (s == "current" || s == "ramping" || s == "draining") {
 			activeByBuildID[c.BuildID] = struct{}{}
 		}
 		if s == "draining" {
@@ -463,13 +468,23 @@ func collectState(ctx context.Context, namespace, name string) (apiState, error)
 	}
 	state.Versions = cards
 
-	// Hide versions that have no active workflows AND no running K8s replicas.
-	// Versions with active K8s deployments (replicas > 0) remain visible even
-	// after their workflows finish — this shows the full rainbow of active pollers.
-	if workflowTotal > 0 {
+	// Filter versions:
+	// - Always hide deprecated versions the controller has fully drained.
+	// - Hide target-only versions that aren't actively ramping and have no workflows
+	//   (e.g. new deployments briefly showing as "Draining" before they register).
+	// - When we have reliable workflow data, hide anything with 0 active workflows.
+	{
 		filtered := make([]versionCard, 0, len(cards))
 		for _, c := range cards {
-			if c.ActiveWorkflowCount <= 0 && c.Replicas <= 0 {
+			if strings.EqualFold(c.Status, "Drained") {
+				continue
+			}
+			isCurrentRole := strings.Contains(c.Role, "current")
+			isTargetOnly := strings.Contains(c.Role, "target") && !isCurrentRole
+			if isTargetOnly && c.BuildID != rampingTargetID && c.ActiveWorkflowCount <= 0 {
+				continue
+			}
+			if workflowTotal > 0 && c.ActiveWorkflowCount <= 0 {
 				continue
 			}
 			filtered = append(filtered, c)
@@ -609,6 +624,10 @@ func collectExecutions(ctx context.Context, namespace, name string, since time.T
 
 	for _, v := range twd.Status.DeprecatedVersion {
 		if v.BuildID == "" {
+			continue
+		}
+		// Only include deprecated versions that have active workflows.
+		if runningByVersion[v.BuildID] <= 0 {
 			continue
 		}
 		versions[v.BuildID] = versionInfo{
@@ -925,39 +944,35 @@ func buildCard(ctx context.Context, role string, v versionRef) versionCard {
 //
 // TrafficPct is set only for current/target (new-workflow routing).
 // Deprecated/draining versions get Draining=true so the UI shows them correctly.
-func computeTraffic(cards []versionCard) (newWorkflowPcts map[string]float64, drainingIDs map[string]bool) {
+func computeTraffic(cards []versionCard) (newWorkflowPcts map[string]float64, drainingIDs map[string]bool, rampingTargetID string) {
 	newWorkflowPcts = map[string]float64{}
 	drainingIDs = map[string]bool{}
 
-	var (
-		currentID  string
-		targetID   string
-		targetRamp *float64
-		isRamping  bool
-	)
+	var currentID, targetID string
+	var targetRamp *float64
 
 	for _, c := range cards {
-		switch strings.ToLower(c.Status) {
-		case "current":
+		isCurrent := strings.Contains(c.Role, "current")
+		isTarget := strings.Contains(c.Role, "target")
+
+		if isCurrent {
 			currentID = c.BuildID
-		case "ramping":
-			if strings.Contains(c.Role, "target") || c.Role == "target" {
-				targetID = c.BuildID
-				targetRamp = c.RampPct
-				isRamping = true
-			}
-		case "inactive":
-			// Target registered but not yet ramping
-			if strings.Contains(c.Role, "target") || c.Role == "target" {
-				targetID = c.BuildID
-				targetRamp = c.RampPct
-			}
-		case "draining":
+		}
+		// A target with a rampPercentage is actively ramping.
+		if isTarget && c.RampPct != nil {
+			targetID = c.BuildID
+			targetRamp = c.RampPct
+		}
+		// Only purely deprecated cards (not also current or target) are draining.
+		if !isCurrent && !isTarget {
 			drainingIDs[c.BuildID] = true
 		}
 	}
 
-	if isRamping && targetID != "" {
+	// Active ramp: target exists, has a ramp percentage, and is a different version from current.
+	// When current == target (same buildID), the ramp just completed — don't treat as ramping.
+	if targetID != "" && targetID != currentID {
+		rampingTargetID = targetID
 		ramp := 0.0
 		if targetRamp != nil {
 			ramp = clampPct(*targetRamp)
@@ -966,22 +981,8 @@ func computeTraffic(cards []versionCard) (newWorkflowPcts map[string]float64, dr
 		if currentID != "" {
 			newWorkflowPcts[currentID] = clampPct(100 - ramp)
 		}
-		return
 	}
 
-	// Rollout complete or not yet started — current gets 100% of new starts.
-	if currentID != "" {
-		newWorkflowPcts[currentID] = 100
-		return
-	}
-	// Only a target exists (e.g. initial deploy).
-	if targetID != "" {
-		v := 100.0
-		if targetRamp != nil {
-			v = clampPct(*targetRamp)
-		}
-		newWorkflowPcts[targetID] = v
-	}
 	return
 }
 
