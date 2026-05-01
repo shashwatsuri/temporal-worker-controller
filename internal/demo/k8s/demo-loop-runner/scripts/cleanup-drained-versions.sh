@@ -49,7 +49,11 @@ VERSION_COUNT=$(echo "$ALL_VERSIONS" | wc -l | tr -d ' ')
 # Get the current version (can't be deleted)
 CURRENT_BUILD_ID=$(echo "$DESCRIBE_JSON" | jq -r '.routingConfig.currentVersionBuildID // ""' || true)
 
-echo "[$TIMESTAMP] Found $VERSION_COUNT versions, current: ${CURRENT_BUILD_ID:-(none)}"
+# Get the TWD target version from K8s (actively ramping, also protected)
+TARGET_BUILD_ID=$(kubectl get temporalworkerdeployment "$RELEASE_NAME" -n "$NAMESPACE" \
+  -o jsonpath='{.status.targetVersion.buildID}' 2>/dev/null || true)
+
+echo "[$TIMESTAMP] Found $VERSION_COUNT versions, current: ${CURRENT_BUILD_ID:-(none)}, target: ${TARGET_BUILD_ID:-(none)}"
 
 DELETED=0
 SKIPPED=0
@@ -57,8 +61,8 @@ FAILED=0
 HAS_WORKFLOWS=0
 
 for BUILD_ID in $ALL_VERSIONS; do
-  # Never delete current version
-  if [ "$BUILD_ID" = "$CURRENT_BUILD_ID" ]; then
+  # Never delete current or target version
+  if [ "$BUILD_ID" = "$CURRENT_BUILD_ID" ] || [ "$BUILD_ID" = "$TARGET_BUILD_ID" ]; then
     SKIPPED=$((SKIPPED + 1))
     continue
   fi
@@ -123,5 +127,34 @@ for BUILD_ID in $ALL_VERSIONS; do
 done
 
 echo "[$TIMESTAMP] Temporal cleanup: deleted=$DELETED skipped=$SKIPPED has_workflows=$HAS_WORKFLOWS failed=$FAILED"
+
+# Catch-all: terminate any running workflows NOT on current or target version.
+# This handles workflows pinned to versions already deleted from Temporal.
+CATCHALL_QUERY="ExecutionStatus='Running' AND TemporalWorkerDeployment='${WORKER_DEPLOYMENT_NAME}'"
+if [ -n "$CURRENT_BUILD_ID" ]; then
+  CATCHALL_QUERY="$CATCHALL_QUERY AND TemporalWorkerDeploymentVersion != '${WORKER_DEPLOYMENT_NAME}:${CURRENT_BUILD_ID}'"
+fi
+if [ -n "$TARGET_BUILD_ID" ]; then
+  CATCHALL_QUERY="$CATCHALL_QUERY AND TemporalWorkerDeploymentVersion != '${WORKER_DEPLOYMENT_NAME}:${TARGET_BUILD_ID}'"
+fi
+
+ORPHAN_COUNT=$(temporal workflow count \
+  --query "$CATCHALL_QUERY" \
+  --address "$TEMPORAL_ADDRESS" \
+  -n "$TEMPORAL_NAMESPACE" \
+  --api-key "$TEMPORAL_API_KEY" \
+  --tls 2>/dev/null | grep -oE '[0-9]+' || echo "0")
+
+if [ "$ORPHAN_COUNT" -gt 0 ] 2>/dev/null; then
+  echo "[$TIMESTAMP] Catch-all: terminating $ORPHAN_COUNT workflows not on current/target"
+  temporal workflow terminate \
+    --query "$CATCHALL_QUERY" \
+    --reason "Pinned to inactive version (not current or target)" \
+    --address "$TEMPORAL_ADDRESS" \
+    -n "$TEMPORAL_NAMESPACE" \
+    --api-key "$TEMPORAL_API_KEY" \
+    --tls \
+    --yes 2>&1 || true
+fi
 
 echo "[$TIMESTAMP] Cleanup complete"
