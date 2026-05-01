@@ -114,8 +114,10 @@ metadata:
     alb.ingress.kubernetes.io/ssl-redirect: "443"
     # Set this to your ACM certificate ARN before applying.
     alb.ingress.kubernetes.io/certificate-arn: "arn:aws:acm:us-east-2:025066239481:certificate/f1084339-83cd-471a-964a-877799ef8239"
-    alb.ingress.kubernetes.io/healthcheck-path: /api/state
+    alb.ingress.kubernetes.io/subnets: subnet-020cbb1d237801119,subnet-0c6238d501a8f9328
+    alb.ingress.kubernetes.io/healthcheck-path: /healthz
     alb.ingress.kubernetes.io/success-codes: "200"
+    alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=30,load_balancing.cross_zone.enabled=true
 spec:
   ingressClassName: alb
   rules:

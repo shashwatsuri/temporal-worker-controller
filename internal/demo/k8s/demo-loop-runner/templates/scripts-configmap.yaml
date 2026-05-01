@@ -1,0 +1,26 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rainbow-release-scripts
+data:
+  run_release_once.sh: |
+{{ .Files.Get "scripts/run_release_once.sh" | indent 4 }}
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rainbow-traffic-scripts
+data:
+  generate-traffic.sh: |
+{{ .Files.Get "scripts/generate-traffic.sh" | indent 4 }}
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rainbow-cleanup-scripts
+data:
+  cleanup-drained-versions.sh: |
+{{ .Files.Get "scripts/cleanup-drained-versions.sh" | indent 4 }}

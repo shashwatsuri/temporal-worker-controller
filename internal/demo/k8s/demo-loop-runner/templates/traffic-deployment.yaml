@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rainbow-traffic
+  labels:
+    app: rainbow-traffic
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rainbow-traffic
+  template:
+    metadata:
+      labels:
+        app: rainbow-traffic
+    spec:
+      serviceAccountName: rainbow-demo-runner
+      restartPolicy: Always
+      volumes:
+        - name: scripts
+          configMap:
+            name: rainbow-traffic-scripts
+            defaultMode: 0755
+      containers:
+        - name: traffic
+          image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args: ["while true; do /opt/scripts/generate-traffic.sh || true; sleep \"$INTERVAL_SECONDS\"; done"]
+          volumeMounts:
+            - name: scripts
+              mountPath: /opt/scripts
+              readOnly: true
+          env:
+            - name: INTERVAL_SECONDS
+              value: {{ .Values.traffic.intervalSeconds | quote }}
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: TEMPORAL_ADDRESS
+              value: {{ .Values.temporal.address | quote }}
+            - name: TEMPORAL_NAMESPACE
+              value: {{ .Values.temporal.namespace | quote }}
+            - name: TEMPORAL_TASK_QUEUE
+              value: {{ .Values.temporal.taskQueue | default (printf "%s/%s" .Release.Namespace .Values.release.name) | quote }}
+            - name: WORKFLOW_TYPE
+              value: {{ .Values.traffic.workflowType | quote }}
+            - name: WORKFLOWS_PER_RUN
+              value: {{ .Values.traffic.workflowsPerRun | quote }}
+            - name: TEMPORAL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.temporal.apiKey.secretName | quote }}
+                  key: {{ .Values.temporal.apiKey.secretKey | quote }}
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi

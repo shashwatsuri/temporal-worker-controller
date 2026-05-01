@@ -30,15 +30,6 @@ RUN set -eux; \
 	tar -xzf /tmp/helm.tar.gz -C /usr/local/bin --strip-components=1 "linux-${arch}/helm"; \
 	rm -f /tmp/helm.tar.gz
 
-COPY internal/demo/scripts/demo_loop.sh /opt/release-scripts/demo_loop.sh
-COPY internal/demo/scripts/generate-traffic.sh /opt/release-scripts/generate-traffic.sh
-COPY internal/demo/scripts/generate_version_cron.sh /opt/release-scripts/generate_version_cron.sh
-COPY internal/demo/scripts/build_version_kaniko.sh /opt/release-scripts/build_version_kaniko.sh
-COPY internal/demo/scripts/deploy_version_skaffold.sh /opt/release-scripts/deploy_version_skaffold.sh
-COPY internal/demo/scripts/run_release_once.sh /opt/release-scripts/run_release_once.sh
-
-RUN chmod +x /opt/release-scripts/*.sh
-
 WORKDIR /work
 
 ENTRYPOINT ["/bin/sh"]

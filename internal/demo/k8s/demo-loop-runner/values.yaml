@@ -9,18 +9,17 @@ aws:
 
 release:
   name: helloworld
-  repoUrl: https://github.com/shashwatsuri/temporal-worker-controller
-  repoRef: main
-  worker: helloworld
+  ecrRepo: 025066239481.dkr.ecr.us-east-2.amazonaws.com/helloworld
+  sourceTag: latest
+  intervalSeconds: "30"
 
-loop:
-  intervalSeconds: "180"
-  waitForTwdRollout: "false"
-  workflowsPerRun: "5"
-  maxNewWorkflowsPerRun: "5"
-  maxRunningWorkflows: "10"
-  continueOnReleaseFailure: "1"
-  continueOnTrafficFailure: "1"
+traffic:
+  intervalSeconds: "3"
+  workflowType: HelloWorld
+  workflowsPerRun: "6"
+
+cleanup:
+  intervalSeconds: "30"
 
 temporal:
   address: ""

@@ -14,7 +14,7 @@ trap cleanup EXIT INT TERM
 git clone --depth 1 --branch "$REPO_REF" "$REPO_URL" "$WORK_DIR/repo"
 cd "$WORK_DIR/repo"
 
-IMAGE_TAG=$(ROOT_DIR="$WORK_DIR/repo" /opt/release-scripts/generate_version_cron.sh | tail -n 1)
+IMAGE_TAG=$(ROOT_DIR="$WORK_DIR/repo" /opt/scripts/generate_version_cron.sh | tail -n 1)
 if [ -z "$IMAGE_TAG" ]; then
   echo "[$TIMESTAMP] ERROR: generate_version_cron.sh did not produce an image tag"
   exit 1
@@ -24,8 +24,8 @@ export DD_GIT_COMMIT_SHA
 DD_GIT_COMMIT_SHA=$(git rev-parse HEAD)
 export DD_GIT_REPOSITORY_URL="$REPO_URL"
 
-/opt/release-scripts/build_version_kaniko.sh "$IMAGE_TAG" "$REPO_URL" "$DD_GIT_COMMIT_SHA"
-/opt/release-scripts/deploy_version_skaffold.sh "$IMAGE_TAG" "$NAMESPACE" "$RELEASE_NAME"
+/opt/scripts/build_version_kaniko.sh "$IMAGE_TAG" "$REPO_URL" "$DD_GIT_COMMIT_SHA"
+/opt/scripts/deploy_version_skaffold.sh "$IMAGE_TAG" "$NAMESPACE" "$RELEASE_NAME"
 
 # Capture the build ID of the newly-deployed target version so the traffic step
 # can pin workflows to it. The controller derives the build ID from the image tag plus

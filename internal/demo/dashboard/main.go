@@ -239,6 +239,10 @@ func main() {
 		log.Fatalf("failed to mount embedded static files: %v", err)
 	}
 	mux.Handle("/", http.FileServer(http.FS(staticSub)))
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
 	mux.HandleFunc("/api/state", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
@@ -300,10 +304,26 @@ func main() {
 	mux.HandleFunc("/api/executions", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
+		var since time.Time
+		if s := r.URL.Query().Get("since"); s != "" {
+			parsed, err := time.Parse(time.RFC3339, s)
+			if err != nil {
+				// Try parsing as Unix milliseconds (e.g. Date.now() in JS)
+				ms, msErr := strconv.ParseInt(s, 10, 64)
+				if msErr != nil {
+					w.WriteHeader(http.StatusBadRequest)
+					_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid 'since' parameter: expected RFC3339 timestamp or Unix milliseconds"})
+					return
+				}
+				parsed = time.UnixMilli(ms)
+			}
+			since = parsed
+		}
+
 		ctx, cancel := context.WithTimeout(r.Context(), 75*time.Second)
 		defer cancel()
 
-		resp, err := collectExecutions(ctx, *namespace, *name)
+		resp, err := collectExecutions(ctx, *namespace, *name, since)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
@@ -314,7 +334,19 @@ func main() {
 
 	addr := fmt.Sprintf(":%d", *port)
 	log.Printf("Rainbow dashboard available at http://localhost%s", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+
+	if err := http.ListenAndServe(addr, handler); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -513,7 +545,7 @@ func collectState(ctx context.Context, namespace, name string) (apiState, error)
 	return state, nil
 }
 
-func collectExecutions(ctx context.Context, namespace, name string) (executionsAPIResponse, error) {
+func collectExecutions(ctx context.Context, namespace, name string, since time.Time) (executionsAPIResponse, error) {
 	var twd twdResource
 	if err := kubectlJSON(ctx, &twd, "-n", namespace, "get", "temporalworkerdeployment", name, "-o", "json"); err != nil {
 		return executionsAPIResponse{}, err
@@ -527,6 +559,9 @@ func collectExecutions(ctx context.Context, namespace, name string) (executionsA
 
 	deploymentKey := fmt.Sprintf("%s/%s", namespace, name)
 	query := fmt.Sprintf(`ExecutionStatus="Running" AND TemporalWorkerDeployment=%q`, deploymentKey)
+	if !since.IsZero() {
+		query += fmt.Sprintf(` AND StartTime > '%s'`, since.UTC().Format(time.RFC3339))
+	}
 
 	executions, err := temporalWorkflowList(ctx, cfg, query, deploymentKey)
 	if err != nil {
@@ -599,10 +634,13 @@ func collectExecutions(ctx context.Context, namespace, name string) (executionsA
 }
 
 type workflowListEntry struct {
-	WorkflowID string `json:"workflowId"`
-	// SearchAttributes may contain TemporalWorkerDeploymentVersion
+	Execution struct {
+		WorkflowID string `json:"workflowId"`
+	} `json:"execution"`
 	SearchAttributes struct {
-		TemporalWorkerDeploymentVersion []string `json:"TemporalWorkerDeploymentVersion"`
+		IndexedFields map[string]struct {
+			Data string `json:"data"` // base64-encoded JSON value
+		} `json:"indexedFields"`
 	} `json:"searchAttributes"`
 }
 
@@ -652,17 +690,33 @@ func temporalWorkflowList(ctx context.Context, cfg temporalAccessConfig, query, 
 	executions := make([]executionEntry, 0, len(entries))
 	for _, e := range entries {
 		version := ""
-		if len(e.SearchAttributes.TemporalWorkerDeploymentVersion) > 0 {
-			// Format is "namespace/name:buildID" — extract the buildID part
-			raw := e.SearchAttributes.TemporalWorkerDeploymentVersion[0]
-			if strings.HasPrefix(raw, deploymentKey+":") {
-				version = strings.TrimPrefix(raw, deploymentKey+":")
-			} else {
-				version = raw
+		if field, ok := e.SearchAttributes.IndexedFields["TemporalWorkerDeploymentVersion"]; ok && field.Data != "" {
+			decoded, err := base64.StdEncoding.DecodeString(field.Data)
+			if err == nil {
+				// Value is a JSON string like "default/helloworld:buildID"
+				var strVal string
+				if json.Unmarshal(decoded, &strVal) == nil && strVal != "" {
+					if strings.HasPrefix(strVal, deploymentKey+":") {
+						version = strings.TrimPrefix(strVal, deploymentKey+":")
+					} else {
+						version = strVal
+					}
+				} else {
+					// Or a JSON array like ["default/helloworld:buildID"]
+					var arrVal []string
+					if json.Unmarshal(decoded, &arrVal) == nil && len(arrVal) > 0 {
+						raw := arrVal[0]
+						if strings.HasPrefix(raw, deploymentKey+":") {
+							version = strings.TrimPrefix(raw, deploymentKey+":")
+						} else {
+							version = raw
+						}
+					}
+				}
 			}
 		}
 		executions = append(executions, executionEntry{
-			ID:      e.WorkflowID,
+			ID:      e.Execution.WorkflowID,
 			Version: version,
 		})
 	}

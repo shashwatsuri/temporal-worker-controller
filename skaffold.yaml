@@ -126,9 +126,11 @@ profiles:
               aws.roleArn: arn:aws:iam::025066239481:role/rainbow-version-generator-role
               aws.region: us-east-2
               release.name: helloworld
+              release.intervalSeconds: "90"
               release.repoUrl: https://github.com/shashwatsuri/temporal-worker-controller
               release.repoRef: main
               release.worker: helloworld
+              temporal.workerDeployment: default/helloworld
             valuesFiles:
               - internal/demo/k8s/demo-loop-runner/values.yaml
 
